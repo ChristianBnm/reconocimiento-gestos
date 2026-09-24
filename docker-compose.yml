@@ -1,0 +1,17 @@
+services:
+  tesis:
+    build: .
+    container_name: tesis_gestos
+    ports:
+      - "8888:8888"
+    volumes:
+      - ./notebooks:/workspace/notebooks
+      - ./data:/workspace/data
+      - ./src:/workspace/src
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
