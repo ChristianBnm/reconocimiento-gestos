@@ -7,12 +7,13 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from torch.utils.data import Dataset
 
-
 # ============================================================
 # Transformaciones de entrenamiento
 # ============================================================
 
-transformacion = A.Compose([
+transformacion_train = A.Compose([
+    A.Resize(224, 224),
+
     A.HorizontalFlip(p=0.5),
 
     A.Affine(
@@ -23,6 +24,21 @@ transformacion = A.Compose([
     ),
 
     A.RandomBrightnessContrast(p=0.2),
+
+    A.Normalize(
+        mean=(0.5, 0.5, 0.5),
+        std=(0.5, 0.5, 0.5)
+    ),
+
+    ToTensorV2()
+])
+
+# ============================================================
+# Transformaciones de validación y test
+# ============================================================
+
+transformacion_eval = A.Compose([
+    A.Resize(224, 224),
 
     A.Normalize(
         mean=(0.5, 0.5, 0.5),
@@ -151,6 +167,45 @@ class GestosDataset(Dataset):
 
         return imagen, etiqueta
 
+
+class DatasetSubset(Dataset):
+    """
+    Subconjunto de un GestosDataset utilizando índices específicos
+    y una transformación propia.
+    """
+
+    def __init__(self, dataset, indices, transformacion=None):
+        self.dataset = dataset
+        self.indices = indices
+        self.transformacion = transformacion
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, indice):
+        indice_original = self.indices[indice]
+
+        ruta = self.dataset.rutas_imagenes[indice_original]
+        etiqueta = self.dataset.etiquetas[indice_original]
+
+        imagen = cv2.imread(ruta)
+
+        if imagen is None:
+            raise ValueError(
+                f"No se pudo cargar la imagen: {ruta}"
+            )
+
+        imagen = cv2.cvtColor(
+            imagen,
+            cv2.COLOR_BGR2RGB
+        )
+
+        if self.transformacion:
+            imagen = self.transformacion(
+                image=imagen
+            )["image"]
+
+        return imagen, etiqueta
 
 # ============================================================
 # Visualización

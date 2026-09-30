@@ -3,7 +3,7 @@ from pathlib import Path
 import torch
 import os
 
-from dataset_utils import GestosDataset, transformacion
+from dataset_utils import GestosDataset, transformacion_train
 
 
 # ============================================================
@@ -48,7 +48,7 @@ dataset = GestosDataset(
         str(DATASET_BASE),
         str(DATASET_COMPLEMENTARIO)
     ],
-    transformacion=transformacion
+    transformacion = transformacion_train
 )
 
 print("\n--- Cantidad de rutas por raíz REAL ---")
