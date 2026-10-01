@@ -14,10 +14,10 @@ from torch.utils.data import Dataset
 transformacion_train = A.Compose([
     A.Resize(224, 224),
 
-    A.HorizontalFlip(p=0.5),
+    A.HorizontalFlip(p = 0.5),
 
     A.Affine(
-        translate_percent=0.05,
+        translate_percent = 0.05,
         scale=(0.95, 1.05),
         rotate=(-15, 15),
         p=0.5
@@ -81,8 +81,8 @@ transformacion_contornos = A.Compose([
     A.Lambda(image=filtro_contornos),
 
     A.Normalize(
-        mean=(0.5, 0.5, 0.5),
-        std=(0.5, 0.5, 0.5)
+        mean = (0.5, 0.5, 0.5),
+        std = (0.5, 0.5, 0.5)
     ),
 
     ToTensorV2()
@@ -128,7 +128,7 @@ class GestosDataset(Dataset):
                 if not os.path.isdir(carpeta_clase):
                     continue
 
-                for nombre_archivo in os.listdir(carpeta_clase):
+                for nombre_archivo in sorted(os.listdir(carpeta_clase)):
 
                     ruta_completa = os.path.join(
                         carpeta_clase,

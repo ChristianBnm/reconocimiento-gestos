@@ -8,6 +8,8 @@ services:
       - ./notebooks:/workspace/notebooks
       - ./data:/workspace/data
       - ./src:/workspace/src
+      - ./checkpoints:/workspace/checkpoints
+      - ./results:/workspace/results
     deploy:
       resources:
         reservations:

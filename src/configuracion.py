@@ -1,16 +1,38 @@
 # ============================================================
-# Configuración de división del dataset
+# Identificación del experimento
+# ============================================================
+
+MODELO = "mobilenetv2"
+
+ARQUITECTURA = "mobilenetv2_100"
+
+NUM_CLASSES = 37
+
+
+# ============================================================
+# División del dataset
 # ============================================================
 
 TRAIN_SIZE = 0.70
 VAL_SIZE = 0.15
 TEST_SIZE = 0.15
 
-# Semilla para poder reproducir la misma división.
 SEED = 42
+
+
+# ============================================================
+# DataLoader
+# ============================================================
+
 BATCH_SIZE = 32
 
-# Parámetros de entrenamiento
+
+# ============================================================
+# Entrenamiento
+# ============================================================
+
 LEARNING_RATE = 0.001
 WEIGHT_DECAY = 0.0001
+
 EPOCHS = 30
+PATIENCE = 5

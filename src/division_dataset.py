@@ -22,7 +22,7 @@ def dividir_dataset(
         indices,
         test_size=val_size + test_size,
         random_state=seed,
-        stratify=etiquetas
+        stratify = etiquetas
     )
 
     proporcion_val = val_size / (val_size + test_size)
@@ -35,8 +35,8 @@ def dividir_dataset(
     indices_val, indices_test = train_test_split(
         indices_temp,
         test_size=1 - proporcion_val,
-        random_state=seed,
-        stratify=etiquetas_temp
+        random_state = seed,
+        stratify = etiquetas_temp
     )
 
     return indices_train, indices_val, indices_test
