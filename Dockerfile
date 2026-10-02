@@ -3,44 +3,22 @@ FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
-    python3-dev \
     python3-pip \
-    python3-venv \
-    git \
+    python3-dev \
     libglib2.0-0 \
-    libsm6 \
-    libxext6 \
-    libxrender1 \
     libgl1 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN python3 -m pip install --upgrade pip
+RUN ln -sf /usr/bin/python3 /usr/local/bin/python
 
 WORKDIR /workspace
 
-COPY requirements.txt .
+COPY requirements.txt /workspace/requirements.txt
+COPY requirements-dev.txt /workspace/requirements-dev.txt
 
-RUN pip install --no-cache-dir \
-    torch==2.5.1 \
-    torchvision==0.20.1 \
-    torchaudio==2.5.1 \
-    --index-url https://download.pytorch.org/whl/cu118
+RUN python3 -m pip install --no-cache-dir --upgrade pip \
+    && python3 -m pip install --no-cache-dir -r /workspace/requirements-dev.txt
 
-RUN pip install --no-cache-dir \
-    numpy \
-    pandas \
-    matplotlib \
-    seaborn \
-    scikit-learn \
-    opencv-python \
-    Pillow \
-    tqdm \
-    albumentations \
-    timm \
-    jupyter \
-    jupyterlab \
-    ipywidgets
-
-CMD ["jupyter", "lab", "--ip=0.0.0.0", "--allow-root", "--no-browser"]
+CMD ["bash", "-lc", "sleep infinity"]

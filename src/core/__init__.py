@@ -1,0 +1,1 @@
+"""Componentes centrales del proyecto."""

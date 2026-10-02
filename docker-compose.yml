@@ -1,19 +1,17 @@
 services:
   tesis:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: tesis_gestos
-    ports:
-      - "8888:8888"
+    working_dir: /workspace
+    gpus: all
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      PYTHONUNBUFFERED: "1"
     volumes:
-      - ./notebooks:/workspace/notebooks
-      - ./data:/workspace/data
-      - ./src:/workspace/src
-      - ./checkpoints:/workspace/checkpoints
-      - ./results:/workspace/results
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+      - ./:/workspace
+    stdin_open: true
+    tty: true
+    command: ["bash", "-lc", "sleep infinity"]

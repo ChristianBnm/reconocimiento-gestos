@@ -1,29 +1,17 @@
-# Dataset
 data/
-
-# Python
+checkpoints/
+results/
 __pycache__/
 *.py[cod]
 *.pyo
-
-# Entornos virtuales
 .venv/
 venv/
 env/
-
-# Jupyter
 .ipynb_checkpoints/
-
-# Resultados y modelos generados
-results/
-checkpoints/
 *.pth
 *.pt
-
-# Sistema operativo
 .DS_Store
 Thumbs.db
-
-# IDE
 .vscode/
 .idea/
+.pytest_cache/
