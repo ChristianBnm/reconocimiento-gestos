@@ -39,6 +39,19 @@ def main():
         xticks_rotation=90,
         values_format="d",
     )
+
+    for text in ax.texts:
+        if text.get_text() == "1":
+            text.set_color("white")
+            text.set_fontweight("bold")
+            text.set_bbox(
+                dict(
+                    facecolor="black",
+                    edgecolor="black",
+                    boxstyle="square,pad=0.2",
+                )
+            )
+
     ax.set_title(f"Matriz de confusión - {args.modelo}")
     fig.tight_layout()
     fig.savefig(output_path, dpi=300, bbox_inches="tight")

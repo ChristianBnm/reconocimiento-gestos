@@ -14,6 +14,7 @@ from src.core.configuracion.settings import (
 )
 from src.core.dataset.loader import DatasetSubset, GestosDataset
 from src.core.dataset.split import cargar_split, dividir_dataset, guardar_split
+from src.core.dataset.transforms import transformacion_train, transformacion_eval
 from src.core.utils.io import load_json, save_json
 from src.core.utils.paths import ProjectPaths
 from src.core.utils.reproducibilidad import establecer_semilla

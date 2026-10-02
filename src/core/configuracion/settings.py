@@ -9,11 +9,9 @@ _CLASS_FILE = Path(__file__).with_name("clases.json")
 CLASS_NAMES: Tuple[str, ...] = tuple(__import__("json").loads(_CLASS_FILE.read_text(encoding="utf-8")))
 NUM_CLASSES = len(CLASS_NAMES)
 
-
-@dataclass(frozen=True)
-class ModelSpec:
-    """Especificación de un modelo disponible para los experimentos."""
-
+# @dataclass: Genera automáticamente métodos comunes de una clase, como __init__ y __repr__, a partir de sus atributos.
+@dataclass(frozen=True) 
+class ModelSpec: # Especificación de un modelo disponible para los experimentos.
     name: str
     architecture: str
     family: str
@@ -34,9 +32,9 @@ MODEL_REGISTRY: Dict[str, ModelSpec] = {
 }
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True) # Clase 
 class ExperimentConfig:
-    """Configuración completa y serializable de un experimento."""
+    # Configuración completa y serializable de un experimento.
 
     model: ModelSpec
     num_classes: int = NUM_CLASSES
@@ -54,7 +52,7 @@ class ExperimentConfig:
     num_workers: int = 0
     pin_memory: bool = True
 
-    @property
+    @property # property: Se puede usar como atributo este metodo
     def class_names(self) -> Tuple[str, ...]:
         return CLASS_NAMES
 
@@ -83,6 +81,8 @@ def build_experiment_config(model_name: str) -> ExperimentConfig:
     return ExperimentConfig(model=spec)
 
 
+# Devuelve la raíz del repositorio a partir de este archivo.
 def project_root() -> Path:
-    """Devuelve la raíz del repositorio a partir de este archivo."""
     return Path(__file__).resolve().parents[3]
+
+

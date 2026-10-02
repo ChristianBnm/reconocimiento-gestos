@@ -10,7 +10,7 @@ from src.core.modelos.factory import crear_modelo, congelar_backbone
 
 
 class Trainer:
-    """Encapsula el ciclo de entrenamiento, validación y checkpointing."""
+    # Encapsula el ciclo de entrenamiento, validación y checkpointing.
 
     def __init__(
         self,
