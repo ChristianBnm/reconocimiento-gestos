@@ -19,22 +19,39 @@ class ModelSpec: # Especificación de un modelo disponible para los experimentos
 
 
 MODEL_REGISTRY: Dict[str, ModelSpec] = {
+
+    # MODELOS CNN --------------------------------------------------------------------------------------------------------
+
     "mobilenetv2": ModelSpec(
         name="mobilenetv2",
         architecture="mobilenetv2_100",
         family="CNN",
     ),
+    "densenet201": ModelSpec(
+        name="densenet201",
+        architecture="densenet201",
+        family="CNN",
+    ),
+
+    # MODELOS ViT --------------------------------------------------------------------------------------------------------
+
     "vit_tiny": ModelSpec(
-        name="vit_tiny",
-        architecture="vit_tiny_patch16_224",
-        family="Vision Transformer",
+        name = "vit_tiny",
+        architecture = "vit_tiny_patch16_224", # 224×224 y patches 16×16
+        family = "Vision Transformer",
+    ),
+
+    "vit_base": ModelSpec(
+        name = "vit_base",
+        architecture = "vit_base_patch16_224",
+        family = "Vision Transformer",
     ),
 }
 
 
 @dataclass(frozen=True) # Clase 
 class ExperimentConfig:
-    # Configuración completa y serializable de un experimento.
+    # Configuración completa y serializable.
 
     model: ModelSpec
     num_classes: int = NUM_CLASSES
@@ -46,7 +63,8 @@ class ExperimentConfig:
     batch_size: int = 32
     learning_rate: float = 0.001
     weight_decay: float = 0.0001
-    epochs: int = 30
+    epochs: int = 30  # Configuración normal
+    # epochs: int = 1     # Smoke test
     patience: int = 5
     min_delta: float = 0.0
     num_workers: int = 0
