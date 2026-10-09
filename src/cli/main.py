@@ -18,6 +18,8 @@ from src.core.dataset.transforms import transformacion_train, transformacion_eva
 from src.core.utils.io import load_json, save_json
 from src.core.utils.paths import ProjectPaths
 from src.core.utils.reproducibilidad import establecer_semilla
+from scripts.matriz_confusion import generar_matriz_confusion
+from scripts.analizar_errores import analizar_errores
 
 
 def build_dataset(paths: ProjectPaths, config):
@@ -63,9 +65,6 @@ def command_train(args):
     from src.core.entrenamiento.trainer import Trainer
     from src.core.modelos.factory import crear_modelo, congelar_backbone
 
-    from src.core.dataset.transforms import transformacion_eval, transformacion_train
-
-    from src.core.dataset.transforms import transformacion_eval
 
     paths = ProjectPaths(Path(args.root).resolve())
     config = build_experiment_config(args.modelo)
@@ -118,7 +117,6 @@ def command_evaluate(args):
     from src.core.evaluacion.predictor import evaluar_modelo, guardar_predicciones
     from src.core.modelos.factory import cargar_checkpoint, crear_modelo
 
-    from src.core.dataset.transforms import transformacion_eval, transformacion_train
 
     paths = ProjectPaths(Path(args.root).resolve())
     config = build_experiment_config(args.modelo)
@@ -172,6 +170,9 @@ def command_evaluate(args):
     )
     save_json(metrics, results_dir / "metrics.json")
     save_json(classification_report, results_dir / "classification_report.json")
+
+    generar_matriz_confusion(args.modelo, paths.root)
+    analizar_errores(args.modelo, paths.root)
 
     print(json.dumps(metrics, indent=2))
     print(f"Predicciones: {results_dir / 'predicciones.csv'}")
