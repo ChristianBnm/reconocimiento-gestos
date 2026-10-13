@@ -51,7 +51,8 @@ MODEL_REGISTRY: Dict[str, ModelSpec] = {
 
 @dataclass(frozen=True) # Clase 
 class ExperimentConfig:
-    # Configuración completa y serializable.
+    # Configuración .
+    # completa y serializable.
 
     model: ModelSpec
     num_classes: int = NUM_CLASSES
@@ -68,6 +69,8 @@ class ExperimentConfig:
     patience: int = 5
     min_delta: float = 0.0
     num_workers: int = 0
+
+
     pin_memory: bool = True
 
     @property # property: Se puede usar como atributo este metodo
