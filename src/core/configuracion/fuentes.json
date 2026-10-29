@@ -1,0 +1,12 @@
+{
+  "original": {
+    "path": "data/Clases_200",
+    "description": "Dataset original de imágenes",
+    "deduplicate_exact_duplicates": true
+  },
+  "complementario": {
+    "path": "data/Clases_200_comp",
+    "description": "Dataset complementario capturado por el autor",
+    "deduplicate_exact_duplicates": true
+  }
+}

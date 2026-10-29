@@ -4,35 +4,41 @@ import argparse
 import json
 from pathlib import Path
 
+import sys
+
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPOSITORY_ROOT))
+
+from src.core.configuracion.catalogo import cargar_catalogos
 from src.core.configuracion.settings import list_models
-from src.core.utils.paths import ProjectPaths
+from src.core.evaluacion.comparacion import METRICS, cargar_comparacion, ordenar_comparacion
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Compara metrics.json de modelos entrenados.")
+    _, scenarios = cargar_catalogos()
+    parser = argparse.ArgumentParser(description="Compara métricas de modelos en un escenario/fuente.")
     parser.add_argument("--root", default=".")
+    parser.add_argument("--escenario", choices=list(scenarios), default="combinado")
+    parser.add_argument("--fuente", default="original", help="Fuente evaluada (nombre de una fuente configurada).")
     parser.add_argument("--modelos", nargs="+", default=list_models(), choices=list_models())
     args = parser.parse_args()
 
-    paths = ProjectPaths(Path(args.root).resolve())
-    print("modelo | accuracy | precision_macro | recall_macro | f1_macro | balanced_accuracy | cohen_kappa")
-    print("-" * 110)
+    rows = ordenar_comparacion(
+        cargar_comparacion(args.root, args.escenario, args.modelos, args.fuente),
+        metric="f1_macro",
+    )
+    columns = ("model", "status", "n_samples", "accuracy", "precision_macro", "recall_macro", "f1_macro", "balanced_accuracy", "cohen_kappa")
+    print(" | ".join(columns))
+    print("-" * 130)
 
-    for model_name in args.modelos:
-        path = paths.model_results_dir(model_name) / "metrics.json"
-        if not path.exists():
-            print(f"{model_name} | sin metrics.json")
-            continue
-        data = json.loads(path.read_text(encoding="utf-8"))
-        print(
-            f"{model_name} | "
-            f"{data['accuracy']:.6f} | "
-            f"{data['precision_macro']:.6f} | "
-            f"{data['recall_macro']:.6f} | "
-            f"{data['f1_macro']:.6f} | "
-            f"{data['balanced_accuracy']:.6f} | "
-            f"{data['cohen_kappa']:.6f}"
-        )
+    def fmt(value):
+        if value is None:
+            return "N/D"
+        return str(value) if isinstance(value, int) else f"{value:.6f}"
+
+    for row in rows:
+        print(" | ".join(fmt(row.get(column)) for column in columns))
 
 
 if __name__ == "__main__":

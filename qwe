@@ -1,0 +1,89 @@
+[1mdiff --git a/MIGRACION_REFACTOR.md b/MIGRACION_REFACTOR.md[m
+[1mindex 225df96..b933815 100644[m
+[1m--- a/MIGRACION_REFACTOR.md[m
+[1m+++ b/MIGRACION_REFACTOR.md[m
+[36m@@ -1,44 +1,24 @@[m
+[31m-# Migración al refactor[m
+[32m+[m[32m# Notas de migración del pipeline[m
+ [m
+[31m-## Estructura anterior → nueva[m
+[32m+[m[32mEl refactor actual conserva la organización modular del proyecto y agrega controles de escalabilidad y reproducibilidad. La guía de uso vigente, los comandos de entrenamiento por escenario y la estructura de artefactos están documentados en [`README.md`](README.md).[m
+ [m
+[31m-| Antes | Ahora |[m
+[31m-|---|---|[m
+[31m-| `src/configuracion.py` | `src/core/configuracion/settings.py` |[m
+[31m-| `src/dataset_utils.py` | `src/core/dataset/loader.py` + `transforms.py` |[m
+[31m-| `src/division_dataset.py` | `src/core/dataset/split.py` |[m
+[31m-| `src/modelos.py` | `src/core/modelos/factory.py` |[m
+[31m-| `src/entrenamiento.py` | `src/core/entrenamiento/trainer.py` + CLI |[m
+[31m-| `src/evaluacion.py` | `src/core/evaluacion/predictor.py` + CLI |[m
+[31m-| `src/matriz_confusion.py` | `scripts/matriz_confusion.py` |[m
+[31m-| `src/analisis_errores.py` | `scripts/analizar_errores.py` |[m
+[31m-| `src/graficos_entrenamiento.py` | `scripts/graficar_entrenamiento.py` |[m
+[31m-| `src/auditar_dataset.py` | `auditoria/auditar_dataset.py` |[m
+[31m-| `src/probar_*.py` | `pruebas/` |[m
+[32m+[m[32m## Cambios principales[m
+ [m
+[31m-## Comandos principales[m
+[32m+[m[32m- `settings.py`: el número de clases se deriva de un vocabulario configurable; ya no es un valor fijo usado por todos los componentes.[m
+[32m+[m[32m- `clases.json`: orden de etiquetas estable y explícito. Se acepta también el formato `{"classes": [...]}`.[m
+[32m+[m[32m- `fuentes.json` y `escenarios.json`: definen fuentes y combinaciones de entrenamiento fuera del código.[m
+[32m+[m[32m- `loader.py`: guarda el origen, la ruta relativa y el SHA-256 de cada imagen, valida que las imágenes sean legibles y detecta carpetas de clase no declaradas.[m
+[32m+[m[32m- `split.py`: divide por grupos de contenido idéntico, valida las particiones y guarda fingerprints para detectar cambios de contenido.[m
+[32m+[m[32m- `experiment.py`: prepara splits compartidos por fuente y verifica duplicados exactos entre fuentes.[m
+[32m+[m[32m- `transforms.py`: normalización resuelta desde la configuración de cada modelo preentrenado de timm, transformaciones configurables y flip horizontal desactivado por defecto.[m
+[32m+[m[32m- `factory.py`: carga diferida de `timm`, selección explícita de dispositivo, congelamiento o ajuste fino y validación del vocabulario de checkpoints.[m
+[32m+[m[32m- `trainer.py`: checkpoint con configuración y mapeo de etiquetas, escritura atómica de artefactos y tratamiento de BatchNorm en el modo de extractor de características.[m
+[32m+[m[32m- `predictor.py`, `metrics.py` y `reporting.py`: evaluación independiente por fuente, CSV de predicciones, métricas e informes por clase y matrices de confusión.[m
+[32m+[m[32m- `main.py`: comandos para los tres escenarios de entrenamiento, evaluación por fuente e inferencia con el vocabulario guardado en el checkpoint.[m
+[32m+[m[32m- `pruebas/`: pruebas automatizadas para vocabulario variable, carga de datos, particiones y checkpoints.[m
+ [m
+[31m-```bash[m
+[31m-python3 -m src.cli.main modelos[m
+[31m-python3 -m src.cli.main entrenar --modelo mobilenetv2[m
+[31m-python3 -m src.cli.main entrenar --modelo vit_tiny[m
+[31m-python3 -m src.cli.main evaluar --modelo mobilenetv2[m
+[31m-python3 -m src.cli.main evaluar --modelo vit_tiny[m
+[31m-python3 scripts/matriz_confusion.py --modelo mobilenetv2[m
+[31m-python3 scripts/analizar_errores.py --modelo mobilenetv2[m
+[31m-python3 scripts/graficar_entrenamiento.py --modelo mobilenetv2[m
+[31m-python3 -m src.cli.main inferir --modelo mobilenetv2 --imagen data/ejemplo.jpg[m
+[31m-```[m
+[32m+[m[32m## Compatibilidad[m
+ [m
+[31m-Los entry points `src/entrenamiento.py` y `src/evaluacion.py` se mantienen temporalmente para facilitar la transición:[m
+[32m+[m[32mSe conserva el cargador para checkpoints antiguos basados en `state_dict`. Si estos no guardan los nombres y el orden de las clases, el código lo advierte porque no es posible comprobar el mapeo de etiquetas. Para inferencia con ellos puede pasarse `--checkpoint` con la ruta histórica. Los nuevos experimentos escriben checkpoints bajo `checkpoints/<escenario>/<modelo>/` y resultados bajo `results/<escenario>/<modelo>/`, para no mezclar sus artefactos con los históricos.[m
+ [m
+[31m-```bash[m
+[31m-python3 src/entrenamiento.py --modelo vit_tiny[m
+[31m-python3 src/evaluacion.py --modelo vit_tiny[m
+[31m-```[m
+[31m-[m
+[31m-## Cambios metodológicos deliberadamente conservadores[m
+[31m-[m
+[31m-El refactor **no agrega AMP ni scheduler** y mantiene los hiperparámetros base actuales. Sí mejora la trazabilidad del experimento: el split exacto se guarda, se valida con fingerprint y la configuración se registra en JSON.[m
+[31m-[m
+[31m-Los resultados 99.95% / 99.79% obtenidos antes del refactor deben considerarse resultados históricos del código/protocolo anterior hasta volver a ejecutar el pipeline refactorizado con el dataset definitivo.[m
+[32m+[m[32mLas métricas históricas del protocolo anterior no deben combinarse directamente con las del nuevo pipeline: cambió el preprocesamiento, se desactivó por defecto el volteo horizontal y las particiones ahora agrupan duplicados exactos. Todos los modelos y escenarios que se comparen deben entrenarse usando la misma versión de vocabulario y los mismos archivos de partición.[m
+[1mdiff --git a/README.md b/README.md[m
+[1mindex 465a86d..d59c06a 100644[m
+[1m--- a/README.md[m
+[1m+++ b/README.md[m
+[36m@@ -1,71 +1,194 @@[m
+[31m-# Reconocimiento de gestos[m
+[32m+[m[32m# Reconocimiento de Gestos Estáticos[m
+ [m
+[31m-Refactor del proyecto de tesis para separar responsabilidades, mejorar reproducibilidad y preparar una futura interfaz gráfica.[m
+[32m+[m[32mPipeline reproducible y modular para investigar la clasificación de configuraciones manuales estáticas a partir de imágenes. El alcance actual es la clasificación de las clases alfanuméricas incluidas en el vocabulario configurado. El proyecto constituye una base técnica para incorporar más gestos estáticos; no reconoce por sí solo una lengua de señas completa ni secuencias dinámicas.[m
+ [m
+[31m-## Arquitectura[m
+[32m+[m[32m## Principios de diseño[m
+[32m+[m
+[32m+[m[32m- **Vocabulario configurable:** las etiquetas e índices provienen de `src/core/configuracion/clases.json`. La cantidad de clases no está fijada en el código ni en el tamaño de la última capa.[m
+[32m+[m[32m- **Fuentes y escenarios configurables:** las fuentes de imágenes se declaran en `src/core/configuracion/fuentes.json`, y los escenarios de entrenamiento en `src/core/configuracion/escenarios.json`.[m
+[32m+[m[32m- **Separación de responsabilidades:** carga de datos, particionado, transformaciones, fábrica de modelos, entrenamiento, evaluación y persistencia están desacoplados.[m
+[32m+[m[32m- **Trazabilidad:** los splits guardan fingerprint del contenido, vocabulario, semilla y proporciones; los checkpoints registran arquitectura, clases, configuración y escenario.[m
+[32m+[m[32m- **Tratamiento explícito de duplicados exactos:** por defecto, se conserva una sola copia de cada contenido SHA-256 por fuente durante la carga; los archivos del dataset nunca se borran. Las exclusiones se guardan en un manifiesto CSV. Si se desactiva esa política en `fuentes.json`, las copias se mantienen en el dataset pero se agrupan para evitar que queden en particiones diferentes. También se comprueba que las copias entre fuentes permanezcan en la misma partición.[m
+[32m+[m[32m- **Resultados separados:** cada combinación de escenario/modelo usa sus propios directorios y no mezcla los artefactos de otros experimentos.[m
+[32m+[m
+[32m+[m[32mLa comprobación por SHA-256 de

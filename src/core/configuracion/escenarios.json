@@ -1,0 +1,14 @@
+{
+  "original": {
+    "sources": ["original"],
+    "description": "Entrenar únicamente con la fuente original"
+  },
+  "complementario": {
+    "sources": ["complementario"],
+    "description": "Entrenar únicamente con la fuente complementaria"
+  },
+  "combinado": {
+    "sources": ["original", "complementario"],
+    "description": "Entrenar con las particiones de entrenamiento de ambas fuentes"
+  }
+}

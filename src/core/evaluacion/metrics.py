@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Sequence
+import math
 
 from sklearn.metrics import (
     accuracy_score,
@@ -14,19 +15,21 @@ from sklearn.metrics import (
 
 
 def calcular_metricas(y_true: Sequence[int], y_pred: Sequence[int]) -> dict:
+    if len(y_true) != len(y_pred):
+        raise ValueError("y_true e y_pred deben tener la misma longitud.")
+    if len(y_true) == 0:
+        raise ValueError("No se pueden calcular métricas sobre una evaluación vacía.")
+    kappa = float(cohen_kappa_score(y_true, y_pred))
+    if not math.isfinite(kappa):
+        kappa = None
     return {
+        "n_samples": int(len(y_true)),
         "accuracy": float(accuracy_score(y_true, y_pred)),
-        "precision_macro": float(
-            precision_score(y_true, y_pred, average="macro", zero_division=0)
-        ),
-        "recall_macro": float(
-            recall_score(y_true, y_pred, average="macro", zero_division=0)
-        ),
-        "f1_macro": float(
-            f1_score(y_true, y_pred, average="macro", zero_division=0)
-        ),
+        "precision_macro": float(precision_score(y_true, y_pred, average="macro", zero_division=0)),
+        "recall_macro": float(recall_score(y_true, y_pred, average="macro", zero_division=0)),
+        "f1_macro": float(f1_score(y_true, y_pred, average="macro", zero_division=0)),
         "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
-        "cohen_kappa": float(cohen_kappa_score(y_true, y_pred)),
+        "cohen_kappa": kappa,
     }
 
 

@@ -4,18 +4,27 @@ import argparse
 import shutil
 from pathlib import Path
 
+import sys
+
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPOSITORY_ROOT))
+
 import pandas as pd
 
+from src.core.configuracion.catalogo import cargar_catalogos
 from src.core.configuracion.settings import list_models
 from src.core.utils.paths import ProjectPaths
 
 
-def analizar_errores(modelo: str, root: str | Path = ".") -> Path:
+def analizar_errores(
+    modelo: str, root: str | Path = ".", escenario: str = "combinado", fuente: str = "original"
+) -> Path:
     # Lista y copia las imágenes mal clasificadas desde predicciones.csv.
     paths = ProjectPaths(Path(root).resolve())
-    results_dir = paths.model_results_dir(modelo)
-    predictions_path = results_dir / "predicciones.csv"
-    errors_dir = results_dir / "errores"
+    results_dir = paths.model_results_dir(modelo, escenario)
+    predictions_path = results_dir / f"predicciones_{fuente}.csv"
+    errors_dir = results_dir / f"errores_{fuente}"
 
     if not predictions_path.exists():
         raise FileNotFoundError(f"No se encontró: {predictions_path}")
@@ -42,9 +51,11 @@ def analizar_errores(modelo: str, root: str | Path = ".") -> Path:
     print(f"Cantidad de errores: {len(errors)}")
 
     for _, row in errors.iterrows():
-        source = paths.root / Path(row["ruta"])
+        source = Path(row["ruta"])
+        if not source.is_absolute():
+            source = paths.root / source
         destination = errors_dir / (
-            f"real_{row['real']}_pred_{row['prediccion']}_{source.name}"
+            f"{int(row.name):06d}_real_{row['real']}_pred_{row['prediccion']}_{source.name}"
         )
 
         if source.exists():
@@ -64,10 +75,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Copia y lista los errores de clasificación."
     )
+    _, scenarios = cargar_catalogos()
     parser.add_argument("--modelo", required=True, choices=list_models())
+    parser.add_argument("--escenario", choices=list(scenarios), default="combinado")
+    parser.add_argument("--fuente", required=True, help="Fuente de prueba, por ejemplo original o complementario.")
     parser.add_argument("--root", default=".")
     args = parser.parse_args()
-    analizar_errores(args.modelo, args.root)
+    analizar_errores(args.modelo, args.root, args.escenario, args.fuente)
 
 
 if __name__ == "__main__":

@@ -11,8 +11,15 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import sys
+
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPOSITORY_ROOT))
+
 import torch
 
+from src.core.configuracion.catalogo import cargar_catalogos
 from src.core.configuracion.settings import (
     build_experiment_config,
     list_models,
@@ -39,23 +46,39 @@ def medir_modelo(
     device: torch.device,
     warmup: int,
     runs: int,
+    scenario: str,
 ) -> dict:
-    config = build_experiment_config(modelo_nombre)
-    checkpoint = paths.model_checkpoint_dir(modelo_nombre) / "mejor.pth"
+    checkpoint = paths.model_checkpoint_dir(modelo_nombre, scenario) / "mejor.pth"
 
     if not checkpoint.is_file():
         raise FileNotFoundError(
             f"No existe el checkpoint de {modelo_nombre}: {checkpoint}"
         )
 
-    # Cargamos la arquitectura sin pesos preentrenados.
-    # Los pesos entrenados se cargan desde nuestro checkpoint.
+    payload = torch.load(checkpoint, map_location=device, weights_only=True)
+    class_names = payload.get("class_names") if isinstance(payload, dict) else None
+    saved_config = payload.get("experiment_config", {}) if isinstance(payload, dict) else {}
+    architecture = payload.get("architecture") if isinstance(payload, dict) else None
+    config = build_experiment_config(
+        modelo_nombre,
+        class_names=class_names,
+        image_size=int(saved_config.get("image_size", 224)),
+    )
+    architecture = architecture or config.model.architecture
+    # El checkpoint conserva el vocabulario y arquitectura del entrenamiento.
     model = crear_modelo(
-        config.model.architecture,
+        architecture,
         config.num_classes,
         pretrained=False,
+        dispositivo=device,
     )
-    cargar_checkpoint(model, checkpoint, device)
+    cargar_checkpoint(
+        model,
+        checkpoint,
+        device,
+        class_names=class_names,
+        expected_architecture=architecture,
+    )
     model.eval()
 
     parametros = sum(p.numel() for p in model.parameters())
@@ -119,8 +142,10 @@ def medir_modelo(
 
     resultado = {
         "modelo": modelo_nombre,
+        "escenario": scenario,
+        "cantidad_clases": config.num_classes,
         "familia": config.model.family,
-        "arquitectura": config.model.architecture,
+        "arquitectura": architecture,
         "dispositivo": str(device),
         "tamano_entrada": [
             1,
@@ -184,6 +209,7 @@ def medir_modelo(
 
 
 def main() -> None:
+    _, scenarios = cargar_catalogos()
     parser = argparse.ArgumentParser(
         description=(
             "Mide tamaño y latencia de inferencia "
@@ -195,6 +221,13 @@ def main() -> None:
         "--root",
         default=".",
         help="Raíz del repositorio",
+    )
+
+    parser.add_argument(
+        "--escenario",
+        choices=list(scenarios),
+        default="combinado",
+        help="Escenario cuyos checkpoints se van a medir",
     )
 
     parser.add_argument(
@@ -258,17 +291,42 @@ def main() -> None:
     )
 
     resultados = []
+    omitidos = []
 
     for name in args.modelos:
+        checkpoint = paths.model_checkpoint_dir(name, args.escenario) / "mejor.pth"
+
+        if not checkpoint.is_file():
+            mensaje = f"No existe el checkpoint de {name}: {checkpoint}"
+            print(f"Omitiendo {name}: checkpoint inexistente.")
+            omitidos.append({
+                "modelo": name,
+                "estado": "omitido",
+                "motivo": mensaje,
+            })
+            continue
+
         print(f"Midiendo {name}...")
 
-        resultado = medir_modelo(
-            name,
-            paths,
-            device,
-            args.warmup,
-            args.runs,
-        )
+        try:
+            resultado = medir_modelo(
+                name,
+                paths,
+                device,
+                args.warmup,
+                args.runs,
+                args.escenario,
+            )
+        except Exception as exc:
+            # Un fallo individual no debe impedir medir los demás modelos.
+            mensaje = f"{type(exc).__name__}: {exc}"
+            print(f"  Error al medir {name}: {mensaje}")
+            omitidos.append({
+                "modelo": name,
+                "estado": "error",
+                "motivo": mensaje,
+            })
+            continue
 
         resultados.append(resultado)
 
@@ -280,16 +338,23 @@ def main() -> None:
             f"p95={resultado['latencia_p95_ms']} ms"
         )
 
+    if not resultados:
+        parser.error(
+            "No se pudo medir ningún modelo. Verificá que exista al menos "
+            "un checkpoint válido para el escenario seleccionado."
+        )
+
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     payload = {
+        "escenario": args.escenario,
         "fecha_local_ejecucion": (
             datetime.now()
             .astimezone()
             .isoformat(timespec="seconds")
         ),
         "python": platform.python_version(),
-        "pytorch": torch.__version__,
+        "pytorch": str(torch.__version__),
         "cuda_disponible": torch.cuda.is_available(),
         "version_cuda_pytorch": torch.version.cuda,
         "gpu": gpu_name,
@@ -298,6 +363,9 @@ def main() -> None:
             "batch=1. No incluye lectura de imagen, transformaciones, "
             "DataLoader ni postprocesamiento."
         ),
+        "modelos_omitidos_o_con_error": omitidos,
+        "cantidad_modelos_medidos": len(resultados),
+        "cantidad_modelos_omitidos_o_con_error": len(omitidos),
         "resultados": resultados,
     }
 

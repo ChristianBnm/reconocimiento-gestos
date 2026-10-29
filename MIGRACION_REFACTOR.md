@@ -1,44 +1,24 @@
-# Migración al refactor
+# Notas de migración del pipeline
 
-## Estructura anterior → nueva
+El refactor actual conserva la organización modular del proyecto y agrega controles de escalabilidad y reproducibilidad. La guía de uso vigente, los comandos de entrenamiento por escenario y la estructura de artefactos están documentados en [`README.md`](README.md).
 
-| Antes | Ahora |
-|---|---|
-| `src/configuracion.py` | `src/core/configuracion/settings.py` |
-| `src/dataset_utils.py` | `src/core/dataset/loader.py` + `transforms.py` |
-| `src/division_dataset.py` | `src/core/dataset/split.py` |
-| `src/modelos.py` | `src/core/modelos/factory.py` |
-| `src/entrenamiento.py` | `src/core/entrenamiento/trainer.py` + CLI |
-| `src/evaluacion.py` | `src/core/evaluacion/predictor.py` + CLI |
-| `src/matriz_confusion.py` | `scripts/matriz_confusion.py` |
-| `src/analisis_errores.py` | `scripts/analizar_errores.py` |
-| `src/graficos_entrenamiento.py` | `scripts/graficar_entrenamiento.py` |
-| `src/auditar_dataset.py` | `auditoria/auditar_dataset.py` |
-| `src/probar_*.py` | `pruebas/` |
+## Cambios principales
 
-## Comandos principales
+- `settings.py`: el número de clases se deriva de un vocabulario configurable; ya no es un valor fijo usado por todos los componentes.
+- `clases.json`: orden de etiquetas estable y explícito. Se acepta también el formato `{"classes": [...]}`.
+- `fuentes.json` y `escenarios.json`: definen fuentes y combinaciones de entrenamiento fuera del código.
+- `loader.py`: guarda el origen, la ruta relativa y el SHA-256 de cada imagen, valida que las imágenes sean legibles y detecta carpetas de clase no declaradas.
+- `split.py`: divide por grupos de contenido idéntico, valida las particiones y guarda fingerprints para detectar cambios de contenido.
+- `experiment.py`: prepara splits compartidos por fuente y verifica duplicados exactos entre fuentes.
+- `transforms.py`: normalización resuelta desde la configuración de cada modelo preentrenado de timm, transformaciones configurables y flip horizontal desactivado por defecto.
+- `factory.py`: carga diferida de `timm`, selección explícita de dispositivo, congelamiento o ajuste fino y validación del vocabulario de checkpoints.
+- `trainer.py`: checkpoint con configuración y mapeo de etiquetas, escritura atómica de artefactos y tratamiento de BatchNorm en el modo de extractor de características.
+- `predictor.py`, `metrics.py` y `reporting.py`: evaluación independiente por fuente, CSV de predicciones, métricas e informes por clase y matrices de confusión.
+- `main.py`: comandos para los tres escenarios de entrenamiento, evaluación por fuente e inferencia con el vocabulario guardado en el checkpoint.
+- `pruebas/`: pruebas automatizadas para vocabulario variable, carga de datos, particiones y checkpoints.
 
-```bash
-python3 -m src.cli.main modelos
-python3 -m src.cli.main entrenar --modelo mobilenetv2
-python3 -m src.cli.main entrenar --modelo vit_tiny
-python3 -m src.cli.main evaluar --modelo mobilenetv2
-python3 -m src.cli.main evaluar --modelo vit_tiny
-python3 scripts/matriz_confusion.py --modelo mobilenetv2
-python3 scripts/analizar_errores.py --modelo mobilenetv2
-python3 scripts/graficar_entrenamiento.py --modelo mobilenetv2
-python3 -m src.cli.main inferir --modelo mobilenetv2 --imagen data/ejemplo.jpg
-```
+## Compatibilidad
 
-Los entry points `src/entrenamiento.py` y `src/evaluacion.py` se mantienen temporalmente para facilitar la transición:
+Se conserva el cargador para checkpoints antiguos basados en `state_dict`. Si estos no guardan los nombres y el orden de las clases, el código lo advierte porque no es posible comprobar el mapeo de etiquetas. Para inferencia con ellos puede pasarse `--checkpoint` con la ruta histórica. Los nuevos experimentos escriben checkpoints bajo `checkpoints/<escenario>/<modelo>/` y resultados bajo `results/<escenario>/<modelo>/`, para no mezclar sus artefactos con los históricos.
 
-```bash
-python3 src/entrenamiento.py --modelo vit_tiny
-python3 src/evaluacion.py --modelo vit_tiny
-```
-
-## Cambios metodológicos deliberadamente conservadores
-
-El refactor **no agrega AMP ni scheduler** y mantiene los hiperparámetros base actuales. Sí mejora la trazabilidad del experimento: el split exacto se guarda, se valida con fingerprint y la configuración se registra en JSON.
-
-Los resultados 99.95% / 99.79% obtenidos antes del refactor deben considerarse resultados históricos del código/protocolo anterior hasta volver a ejecutar el pipeline refactorizado con el dataset definitivo.
+Las métricas históricas del protocolo anterior no deben combinarse directamente con las del nuevo pipeline: cambió el preprocesamiento, se desactivó por defecto el volteo horizontal y las particiones ahora agrupan duplicados exactos. Todos los modelos y escenarios que se comparen deben entrenarse usando la misma versión de vocabulario y los mismos archivos de partición.
