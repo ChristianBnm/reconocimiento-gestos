@@ -15,3 +15,7 @@ Thumbs.db
 .vscode/
 .idea/
 .pytest_cache/
+
+# Archivos locales de respaldo y listados
+tesis_gestos V29-10-26.zip
+archivos_tesis.txt

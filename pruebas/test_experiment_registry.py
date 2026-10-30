@@ -291,3 +291,62 @@ def test_run_con_fecha_invalida_se_rechaza(experiment):
             status="pending",
             created_at="fecha-invalida",
         )
+
+
+def test_transicion_pending_a_failed(registry, experiment):
+    registry.save_experiment(experiment)
+    registry.save_run(
+        RunRecord(
+            run_id="run-001",
+            experiment_id=experiment.experiment_id,
+            status="pending",
+        )
+    )
+
+    updated = registry.update_run_status(
+        "run-001",
+        "failed",
+        error_message="Error antes de iniciar el entrenamiento",
+    )
+
+    assert updated.status == "failed"
+    assert updated.error_message == (
+        "Error antes de iniciar el entrenamiento"
+    )
+    assert updated.finished_at is not None
+
+
+def test_ejecucion_finalizada_no_se_modifica_tras_error(
+    registry, experiment
+):
+    registry.save_experiment(experiment)
+    registry.save_run(
+        RunRecord(
+            run_id="run-001",
+            experiment_id=experiment.experiment_id,
+            status="pending",
+        )
+    )
+    registry.update_run_status("run-001", "cancelled")
+
+    path = registry.runs_dir / "run-001.json"
+    original_content = path.read_bytes()
+
+    with pytest.raises(ValueError, match="ya finalizó"):
+        registry.update_run_status("run-001", "running")
+
+    assert path.read_bytes() == original_content
+
+
+def test_rechaza_estado_inexistente(registry, experiment):
+    registry.save_experiment(experiment)
+    registry.save_run(
+        RunRecord(
+            run_id="run-001",
+            experiment_id=experiment.experiment_id,
+            status="pending",
+        )
+    )
+
+    with pytest.raises(ValueError, match="Estado no válido"):
+        registry.update_run_status("run-001", "unknown")
