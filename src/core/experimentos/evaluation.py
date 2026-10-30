@@ -166,147 +166,110 @@ def evaluar_ejecucion(
         raise ValueError("Las clases del checkpoint no son válidas.")
 
     source_assignments = [
-        dataset
-        for dataset in spec.datasets
-        if dataset.role == "train_source"
+        dataset for dataset in spec.datasets if dataset.role != "unused"
     ]
-    source_names = [dataset.source_name for dataset in source_assignments]
-    path_overrides = {
-        dataset.source_name: dataset.path
-        for dataset in source_assignments
-    }
+    if not source_assignments:
+        raise ValueError("No hay fuentes activas para evaluar.")
 
+    source_names = [dataset.source_name for dataset in source_assignments]
+    path_overrides = {dataset.source_name: dataset.path for dataset in source_assignments}
     paths = ProjectPaths(root)
     prepared = prepare_sources(
-        paths,
-        config,
-        requested_sources=source_names,
-        path_overrides=path_overrides,
-        create_missing_splits=False,
+        paths, config, requested_sources=source_names,
+        path_overrides=path_overrides, create_missing_splits=False,
         regenerate_splits=False,
-    )
-
-    transform = build_eval_transform(config=config)
-    test_datasets = [
-        subset_for(prepared[name], "test", transform)
-        for name in source_names
-    ]
-    if not test_datasets:
-        raise ValueError("No hay fuentes de prueba para evaluar.")
-
-    test_dataset = (
-        test_datasets[0]
-        if len(test_datasets) == 1
-        else ConcatDataset(test_datasets)
-    )
-
-    loader = DataLoader(
-        test_dataset,
-        batch_size=config.batch_size,
-        shuffle=False,
-        num_workers=config.num_workers,
-        pin_memory=config.pin_memory and device.type == "cuda",
     )
 
     architecture = checkpoint.get("architecture")
     if not architecture:
         raise ValueError("El checkpoint no declara la arquitectura.")
-
     model = crear_modelo(
-        architecture,
-        num_classes=num_classes,
-        pretrained=False,
-        dispositivo=device,
+        architecture, num_classes=num_classes, pretrained=False, dispositivo=device
     )
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
     model.eval()
 
-    criterion = nn.CrossEntropyLoss(reduction="sum")
-    confusion = torch.zeros(
-        (num_classes, num_classes), dtype=torch.int64
-    )
-    total_loss = 0.0
-    total_correct = 0
-    total = 0
+    transform = build_eval_transform(config=config)
+    tests: dict[str, dict] = {}
+    external_evaluations: dict[str, dict] = {}
+    for assignment in source_assignments:
+        name = assignment.source_name
+        dataset = subset_for(prepared[name], "test", transform)
+        loader = DataLoader(
+            dataset, batch_size=config.batch_size, shuffle=False,
+            num_workers=config.num_workers,
+            pin_memory=config.pin_memory and device.type == "cuda",
+        )
+        confusion = torch.zeros((num_classes, num_classes), dtype=torch.int64)
+        criterion = nn.CrossEntropyLoss(reduction="sum")
+        total_loss = 0.0
+        total_correct = 0
+        total = 0
+        with torch.inference_mode():
+            for images, labels in loader:
+                images = images.to(device)
+                labels = labels.to(device)
+                logits = model(images)
+                if logits.ndim != 2 or logits.shape[1] != num_classes:
+                    raise ValueError("La salida del modelo no coincide con las clases.")
+                total_loss += criterion(logits, labels).item()
+                predictions = logits.argmax(dim=1)
+                total_correct += (predictions == labels).sum().item()
+                total += labels.numel()
+                encoded = labels * num_classes + predictions
+                confusion += torch.bincount(
+                    encoded, minlength=num_classes * num_classes
+                ).reshape(num_classes, num_classes).cpu()
+        if total == 0:
+            raise ValueError(f"La partición test de '{name}' está vacía.")
 
-    with torch.inference_mode():
-        for images, labels in loader:
-            images = images.to(device)
-            labels = labels.to(device)
-            logits = model(images)
-
-            if logits.ndim != 2 or logits.shape[1] != num_classes:
-                raise ValueError(
-                    "La salida del modelo no coincide con las clases."
-                )
-
-            total_loss += criterion(logits, labels).item()
-            predictions = logits.argmax(dim=1)
-            total_correct += (predictions == labels).sum().item()
-            total += labels.numel()
-
-            encoded = labels * num_classes + predictions
-            confusion += torch.bincount(
-                encoded,
-                minlength=num_classes * num_classes,
-            ).reshape(num_classes, num_classes).cpu()
-
-    if total == 0:
-        raise ValueError("La partición test está vacía.")
-
-    tp = confusion.diag().double()
-    support = confusion.sum(dim=1).double()
-    predicted_count = confusion.sum(dim=0).double()
-
-    precision = torch.where(
-        predicted_count > 0, tp / predicted_count.clamp(min=1),
-        torch.zeros_like(tp),
-    )
-    recall = torch.where(
-        support > 0, tp / support.clamp(min=1), torch.zeros_like(tp)
-    )
-    f1 = torch.where(
-        precision + recall > 0,
-        2 * precision * recall / (precision + recall).clamp(min=1e-15),
-        torch.zeros_like(tp),
-    )
-
-    weighted_f1 = (
-        (f1 * support).sum().item() / support.sum().item()
-        if support.sum().item() else 0.0
-    )
+        tp = confusion.diag().double()
+        support = confusion.sum(dim=1).double()
+        predicted_count = confusion.sum(dim=0).double()
+        precision = torch.where(
+            predicted_count > 0, tp / predicted_count.clamp(min=1),
+            torch.zeros_like(tp),
+        )
+        recall = torch.where(
+            support > 0, tp / support.clamp(min=1), torch.zeros_like(tp)
+        )
+        f1 = torch.where(
+            precision + recall > 0,
+            2 * precision * recall / (precision + recall).clamp(min=1e-15),
+            torch.zeros_like(tp),
+        )
+        weighted_f1 = (f1 * support).sum().item() / support.sum().item()
+        per_source = {
+            "source": name, "role": assignment.role, "partition": "test",
+            "num_samples": total,
+            "metrics": {
+                "loss": total_loss / total,
+                "accuracy": total_correct / total,
+                "precision_macro": precision.mean().item(),
+                "recall_macro": recall.mean().item(),
+                "f1_macro": f1.mean().item(),
+                "f1_weighted": weighted_f1,
+            },
+            "per_class": {
+                class_name: {
+                    "support": int(support[index].item()),
+                    "precision": precision[index].item(),
+                    "recall": recall[index].item(),
+                    "f1": f1[index].item(),
+                } for index, class_name in enumerate(class_names)
+            },
+            "confusion_matrix": confusion.tolist(),
+        }
+        target = external_evaluations if assignment.role == "external_eval" else tests
+        target[name] = per_source
 
     resultado = {
-        "experiment_id": run.experiment_id,
-        "run_id": run.run_id,
-        "model": checkpoint["model"],
-        "architecture": architecture,
+        "experiment_id": run.experiment_id, "run_id": run.run_id,
+        "model": checkpoint["model"], "architecture": architecture,
         "checkpoint_path": paths.relative_to_root(checkpoint_path),
-        "device": str(device),
-        "partition": "test",
-        "sources": source_names,
-        "num_classes": num_classes,
-        "num_samples": total,
-        "metrics": {
-            "loss": total_loss / total,
-            "accuracy": total_correct / total,
-            "precision_macro": precision.mean().item(),
-            "recall_macro": recall.mean().item(),
-            "f1_macro": f1.mean().item(),
-            "f1_weighted": weighted_f1,
-        },
-        "per_class": {
-            name: {
-                "support": int(support[index].item()),
-                "precision": precision[index].item(),
-                "recall": recall[index].item(),
-                "f1": f1[index].item(),
-            }
-            for index, name in enumerate(class_names)
-        },
-        "confusion_matrix": confusion.tolist(),
+        "device": str(device), "num_classes": num_classes,
+        "tests": tests, "external_evaluations": external_evaluations,
     }
-
     _guardar_json_atomico(output_path, resultado)
     resultado["evaluation_path"] = paths.relative_to_root(output_path)
     return resultado
