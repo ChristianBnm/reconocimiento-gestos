@@ -54,6 +54,23 @@ async function request(path, options = {}) {
   return data;
 }
 
+const INITIAL_FORM = {
+  name: "",
+  description: "",
+  model_name: "",
+  source_name: "",
+  role: "train_source",
+  device: "auto",
+  image_size: 224,
+  batch_size: 32,
+  epochs: 30,
+  learning_rate: 0.001,
+  weight_decay: 0.0001,
+  patience: 5,
+  seed: 42,
+  freeze_backbone: true,
+};
+
 function App() {
   const [health, setHealth] = useState("checking");
   const [experiments, setExperiments] = useState([]);
@@ -64,14 +81,9 @@ function App() {
   const [success, setSuccess] = useState("");
   const [showForm, setShowForm] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [deletingId, setDeletingId] = useState(null);
 
-  const [form, setForm] = useState({
-    name: "",
-    description: "",
-    model_name: "",
-    source_name: "",
-    role: "train_source",
-  });
+  const [form, setForm] = useState(INITIAL_FORM);
 
   const loadDashboard = useCallback(async () => {
     setError("");
@@ -121,18 +133,20 @@ function App() {
     setFormError("");
     setSuccess("");
     setForm({
-      name: "",
-      description: "",
+      ...INITIAL_FORM,
       model_name: models[0]?.name ?? "",
       source_name: sources[0]?.name ?? "",
-      role: "train_source",
     });
     setShowForm(true);
   }
 
   async function createExperiment(event) {
     event.preventDefault();
-    setFormError("");
+    setForm({
+      ...INITIAL_FORM,
+      model_name: models[0]?.name ?? "",
+      source_name: sources[0]?.name ?? "",
+    });
     setSuccess("");
 
     if (!form.name.trim()) {
@@ -179,7 +193,17 @@ function App() {
           role: form.role,
         },
       ],
-      parameters: {},
+      parameters: {
+        device: form.device,
+        image_size: Number(form.image_size),
+        batch_size: Number(form.batch_size),
+        epochs: Number(form.epochs),
+        learning_rate: Number(form.learning_rate),
+        weight_decay: Number(form.weight_decay),
+        patience: Number(form.patience),
+        seed: Number(form.seed),
+        freeze_backbone: form.freeze_backbone,
+      },
     };
 
     setSaving(true);
@@ -210,6 +234,38 @@ function App() {
       setFormError(err.message);
     } finally {
       setSaving(false);
+    }
+
+  }
+
+  async function deleteExperiment(experiment) {
+    const { experiment_id, name } = experiment;
+
+    const confirmed = window.confirm(
+      `¿Querés eliminar el experimento "${name}" (${experiment_id})?\n\n` +
+        "Esta acción no se puede deshacer."
+    );
+
+    if (!confirmed) return;
+
+    setDeletingId(experiment_id);
+    setError("");
+    setSuccess("");
+
+    try {
+      await request(`/experiments/${encodeURIComponent(experiment_id)}`, {
+        method: "DELETE",
+      });
+
+      setExperiments((current) =>
+        current.filter((item) => item.experiment_id !== experiment_id)
+      );
+
+      setSuccess(`Experimento ${experiment_id} eliminado correctamente.`);
+    } catch (err) {
+      setError(`No se pudo eliminar ${experiment_id}: ${err.message}`);
+    } finally {
+      setDeletingId(null);
     }
   }
 
@@ -426,7 +482,122 @@ function App() {
                   </select>
                 </label>
 
+                <label>
+                  Dispositivo de ejecución *
+                  <select
+                    name="device"
+                    value={form.device}
+                    onChange={updateForm}
+                    required
+                  >
+                    <option value="auto">Automático</option>
+                    <option value="cpu">CPU</option>
+                    <option value="cuda">GPU NVIDIA (CUDA)</option>
+                  </select>
+                </label>
+
+                <label>
+                  Tamaño de imagen *
+                  <input
+                    type="number"
+                    name="image_size"
+                    min="1"
+                    value={form.image_size}
+                    onChange={updateForm}
+                    required
+                  />
+                </label>
+
+                <label>
+                  Tamaño del batch *
+                  <input
+                    type="number"
+                    name="batch_size"
+                    min="1"
+                    value={form.batch_size}
+                    onChange={updateForm}
+                    required
+                  />
+                </label>
+
+                <label>
+                  Épocas *
+                  <input
+                    type="number"
+                    name="epochs"
+                    min="1"
+                    value={form.epochs}
+                    onChange={updateForm}
+                    required
+                  />
+                </label>
+
+                <label>
+                  Learning rate *
+                  <input
+                    type="number"
+                    name="learning_rate"
+                    min="0.0000001"
+                    step="any"
+                    value={form.learning_rate}
+                    onChange={updateForm}
+                    required
+                  />
+                </label>
+
+                <label>
+                  Weight decay *
+                  <input
+                    type="number"
+                    name="weight_decay"
+                    min="0"
+                    step="any"
+                    value={form.weight_decay}
+                    onChange={updateForm}
+                    required
+                  />
+                </label>
+
+                <label>
+                  Paciencia (early stopping) *
+                  <input
+                    type="number"
+                    name="patience"
+                    min="1"
+                    value={form.patience}
+                    onChange={updateForm}
+                    required
+                  />
+                </label>
+
+                <label>
+                  Semilla aleatoria *
+                  <input
+                    type="number"
+                    name="seed"
+                    min="0"
+                    value={form.seed}
+                    onChange={updateForm}
+                    required
+                  />
+                </label>
+
                 <label className="form-full">
+                  <input
+                    type="checkbox"
+                    name="freeze_backbone"
+                    checked={form.freeze_backbone}
+                    onChange={(event) =>
+                      setForm((current) => ({
+                        ...current,
+                        freeze_backbone: event.target.checked,
+                      }))
+                    }
+                  />
+                  Congelar backbone durante el entrenamiento
+                </label>
+
+                <label className="form-f-ull">
                   Descripción
                   <textarea
                     name="description"
@@ -486,6 +657,7 @@ function App() {
                     <th>Rol</th>
                     <th>Descripción</th>
                     <th>ID</th>
+                    <th>Acciones</th>
                   </tr>
                 </thead>
 
@@ -523,13 +695,25 @@ function App() {
                             ))
                           : "—"}
                       </td>
-
                       <td>{experiment.description || "—"}</td>
-
                       <td>
                         <code>
                           {experiment.experiment_id ?? "Sin ID"}
                         </code>
+                      </td>
+                      <td>
+                        <button
+                          type="button"
+                          className="secondary-button"
+                          disabled={
+                            !experiment.experiment_id || deletingId !== null
+                          }
+                          onClick={() => deleteExperiment(experiment)}
+                        >
+                          {deletingId === experiment.experiment_id
+                            ? "Eliminando..."
+                            : "Eliminar"}
+                          </button>
                       </td>
                     </tr>
                   ))}

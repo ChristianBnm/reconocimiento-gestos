@@ -93,6 +93,10 @@ class ExperimentService:
     def get_experiment(self, experiment_id: str) -> ExperimentSpec:
         return self.registry.load_experiment(experiment_id)
 
+    def delete_experiment(self, experiment_id: str) -> None:
+        """Elimina un experimento sin ejecuciones asociadas."""
+        self.registry.delete_experiment(experiment_id)
+
     def list_experiments(self) -> list[str]:
         return self.registry.list_experiments()
 
@@ -193,6 +197,29 @@ class ExperimentService:
             class_names=cargar_clases(),
             **spec.parameters,
         )
+
+
+    @staticmethod
+    def _resolve_device(config: ExperimentConfig) -> torch.device:
+        """Resuelve el dispositivo solicitado para el entrenamiento."""
+        requested_device = config.device
+
+        if requested_device == "auto":
+            return torch.device(
+                "cuda" if torch.cuda.is_available() else "cpu"
+            )
+
+        if requested_device == "cpu":
+            return torch.device("cpu")
+
+        if requested_device == "cuda":
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    "Se solicitó el dispositivo 'cuda', pero CUDA "
+                    "no está disponible en este entorno."
+                )
+            return torch.device("cuda")
+
 
     @staticmethod
     def _make_loader(
@@ -300,9 +327,8 @@ class ExperimentService:
                 create_missing_splits=True,
             )
 
-            device = torch.device(
-                "cuda" if torch.cuda.is_available() else "cpu"
-            )
+            device = self._resolve_device(config)
+
             model_spec = get_model_spec(spec.model_name)
             model = crear_modelo(
                 model_spec.architecture,
@@ -374,6 +400,7 @@ class ExperimentService:
                     name: dataset_fingerprint(prepared[name].dataset)
                     for name in active_source_names
                 },
+                "requested_device": config.device,
                 "device": str(device),
                 "torch_version": str(torch.__version__),
             }

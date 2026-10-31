@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Literal
 from typing import Mapping, Sequence
 
 
@@ -83,6 +84,7 @@ class ExperimentConfig:
     brightness_contrast_probability: float = 0.2
     normalization_mean: tuple[float, float, float] = (0.485, 0.456, 0.406)
     normalization_std: tuple[float, float, float] = (0.229, 0.224, 0.225)
+    device: Literal["auto", "cpu", "cuda"] = "auto"
 
     def __post_init__(self) -> None:
         if not self.class_names:
@@ -112,6 +114,10 @@ class ExperimentConfig:
             raise ValueError("La normalización debe tener tres canales RGB.")
         if any(value <= 0 for value in self.normalization_std):
             raise ValueError("Los valores de desviación estándar deben ser positivos.")
+        if self.device not in {"auto", "cpu", "cuda"}:
+            raise ValueError(
+        "device debe ser 'auto', 'cpu' o 'cuda'."
+        )
 
     @property
     def num_classes(self) -> int:

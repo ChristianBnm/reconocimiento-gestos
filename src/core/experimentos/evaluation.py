@@ -84,6 +84,7 @@ def _configuracion_del_checkpoint(
         "brightness_contrast_probability",
         "normalization_mean",
         "normalization_std",
+        "device",
     }
     cambios = {
         key: value
@@ -131,8 +132,7 @@ def evaluar_ejecucion(
         )
 
     spec = service.get_experiment(run.experiment_id)
-    run_dir = checkpoint_path.parent
-    output_path = run_dir.parent.parent / "results" / "unused"
+
     # El resultado se guarda en results/experiments/<experiment_id>/<run_id>.
     output_path = (
         root / "results" / "experiments"
@@ -143,14 +143,51 @@ def evaluar_ejecucion(
             f"Ya existe {output_path}. Usá overwrite=True para reemplazarlo."
         )
 
-    device = torch.device(
-        "cuda" if torch.cuda.is_available() else "cpu"
-    )
+    device_solicitado = _configuracion_del_checkpoint(
+        torch.load(
+            checkpoint_path,
+            map_location="cpu",
+            weights_only=False,
+        ),
+        service.get_experiment(run.experiment_id),
+    ).device
+
+    if device_solicitado == "cpu":
+        device = torch.device("cpu")
+    elif device_solicitado == "cuda" and torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        # auto elige el dispositivo disponible. Si se solicitó CUDA
+        # pero no está disponible, la evaluación puede ejecutarse en CPU.
+        device = torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+
     checkpoint = torch.load(
         checkpoint_path,
-        map_location=device,
+        map_location="cpu",
         weights_only=False,
     )
+
+    metadata = checkpoint.get("metadata") or {}
+    if metadata.get("experiment_id") != run.experiment_id:
+        raise ValueError("El checkpoint no coincide con el experimento.")
+    if metadata.get("run_id") != run.run_id:
+        raise ValueError("El checkpoint no coincide con la ejecución.")
+
+    config = _configuracion_del_checkpoint(checkpoint, spec)
+
+    if config.device == "cpu":
+        device = torch.device("cpu")
+    elif config.device == "cuda" and torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        # auto usa el dispositivo disponible.
+        # Si se pidió CUDA y no está disponible, evaluación usa CPU.
+        device = torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+
 
     metadata = checkpoint.get("metadata") or {}
     if metadata.get("experiment_id") != run.experiment_id:
@@ -267,6 +304,7 @@ def evaluar_ejecucion(
         "experiment_id": run.experiment_id, "run_id": run.run_id,
         "model": checkpoint["model"], "architecture": architecture,
         "checkpoint_path": paths.relative_to_root(checkpoint_path),
+        "requested_device": config.device,
         "device": str(device), "num_classes": num_classes,
         "tests": tests, "external_evaluations": external_evaluations,
     }
