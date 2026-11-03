@@ -1,11 +1,14 @@
 
 from fastapi import APIRouter, HTTPException, Response, status
+from threading import Event
 
 from src.api.dependencies import (
     executor,
     experiment_service,
     read_artifact,
     run_experiment_task,
+    run_cancel_events,
+    run_cancel_events_lock,
     training_lock,
 )
 
@@ -30,6 +33,8 @@ def start_run(experiment_id: str, response: Response) -> dict:
 
     try:
         run = experiment_service.create_run(experiment_id)
+        with run_cancel_events_lock:
+            run_cancel_events[run.run_id] = Event()
 
         try:
             executor.submit(
@@ -38,6 +43,8 @@ def start_run(experiment_id: str, response: Response) -> dict:
                 run.run_id,
             )
         except Exception:
+            with run_cancel_events_lock:
+                run_cancel_events.pop(run.run_id, None)
             experiment_service.registry.update_run_status(
                 run.run_id,
                 "failed",
@@ -84,8 +91,33 @@ def get_run(run_id: str) -> dict:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
+@router.post("/api/runs/{run_id}/cancel", status_code=status.HTTP_202_ACCEPTED)
+def cancel_run(run_id: str) -> dict:
+    try:
+        run = experiment_service.get_run(run_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    if run.status not in {"pending", "running"}:
+        raise HTTPException(
+            status_code=409,
+            detail=f"No se puede detener una ejecución con estado '{run.status}'.",
+        )
+
+    with run_cancel_events_lock:
+        cancel_event = run_cancel_events.get(run_id)
+        if cancel_event is None:
+            raise HTTPException(
+                status_code=409,
+                detail="No hay una señal de cancelación activa para esta ejecución.",
+            )
+        cancel_event.set()
+
+    return {"run_id": run_id, "status": "cancellation_requested"}
+
+
 @router.get("/api/runs/{run_id}/history")
-def get_run_history(run_id: str) -> dict:
+def get_run_history(run_id: str) -> list[dict]:
     return read_artifact(run_id, "history.json")
 
 

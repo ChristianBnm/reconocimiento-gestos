@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from threading import Event
 import time
 
 import torch
@@ -8,6 +9,10 @@ import torch
 from src.core.configuracion.settings import ExperimentConfig
 from src.core.modelos.factory import crear_modelo, congelar_backbone, descongelar_modelo
 from src.core.utils.io import save_json
+
+
+class TrainingCancelled(Exception):
+    """Señala una cancelación solicitada desde la API."""
 
 
 class Trainer:
@@ -22,6 +27,7 @@ class Trainer:
         checkpoint_path: Path,
         history_path: Path,
         metadata: dict | None = None,
+        cancel_event: Event | None = None,
     ) -> None:
         self.model = model
         self.train_loader = train_loader
@@ -43,6 +49,11 @@ class Trainer:
             weight_decay=config.weight_decay,
         )
         self.metadata = metadata or {}
+        self.cancel_event = cancel_event or Event()
+
+    def _raise_if_cancelled(self) -> None:
+        if self.cancel_event.is_set():
+            raise TrainingCancelled("El usuario solicitó detener el entrenamiento.")
 
     def _run_epoch(self, loader, training: bool) -> tuple[float, float]:
         if len(loader) == 0:
@@ -61,6 +72,7 @@ class Trainer:
         context = torch.enable_grad() if training else torch.no_grad()
         with context:
             for images, labels in loader:
+                self._raise_if_cancelled()
                 images = images.to(self.device, non_blocking=True)
                 labels = labels.to(self.device, non_blocking=True)
                 if training:
@@ -117,6 +129,7 @@ class Trainer:
         history: list[dict] = []
 
         for epoch in range(1, self.config.epochs + 1):
+            self._raise_if_cancelled()
             epoch_started = time.perf_counter()
             train_loss, train_accuracy = self.train_epoch()
             val_loss, val_accuracy = self.validate_epoch()
@@ -137,6 +150,7 @@ class Trainer:
                 f"Val loss={val_loss:.4f} acc={val_accuracy:.4f}"
             )
 
+            self._raise_if_cancelled()
             if val_loss < best_val_loss - self.config.min_delta:
                 best_val_loss = val_loss
                 epochs_without_improvement = 0

@@ -6,11 +6,12 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 
 import torch
 from torch import nn
-from torch.utils.data import ConcatDataset, DataLoader
+from torch.utils.data import DataLoader
 
 from src.core.configuracion.settings import ExperimentConfig
 from src.core.dataset.experiment import (
@@ -27,6 +28,7 @@ from src.core.modelos.factory import crear_modelo
 def _guardar_json_atomico(path: Path, contenido: dict) -> None:
     """Guarda el resultado sin dejar un JSON parcial ante un error."""
     path.parent.mkdir(parents=True, exist_ok=True)
+
     fd, temporal = tempfile.mkstemp(
         prefix=f".{path.name}.",
         suffix=".tmp",
@@ -46,7 +48,9 @@ def _guardar_json_atomico(path: Path, contenido: dict) -> None:
             archivo.write("\n")
             archivo.flush()
             os.fsync(archivo.fileno())
+
         os.replace(temporal_path, path)
+
     except BaseException:
         temporal_path.unlink(missing_ok=True)
         raise
@@ -58,8 +62,11 @@ def _configuracion_del_checkpoint(
 ) -> ExperimentConfig:
     """Reconstruye la configuración utilizada durante el entrenamiento."""
     config_guardada = checkpoint.get("experiment_config")
+
     if not isinstance(config_guardada, dict):
-        raise ValueError("El checkpoint no contiene experiment_config.")
+        raise ValueError(
+            "El checkpoint no contiene experiment_config."
+        )
 
     config = ExperimentService._build_config(spec)
 
@@ -86,6 +93,7 @@ def _configuracion_del_checkpoint(
         "normalization_std",
         "device",
     }
+
     cambios = {
         key: value
         for key, value in config_guardada.items()
@@ -96,7 +104,99 @@ def _configuracion_del_checkpoint(
         if key in cambios:
             cambios[key] = tuple(cambios[key])
 
-    return __import__("dataclasses").replace(config, **cambios)
+    return replace(config, **cambios)
+
+
+def _validar_checkpoint(
+    checkpoint: dict,
+    run: RunRecord,
+    config: ExperimentConfig,
+) -> tuple[tuple[str, ...], int]:
+    """Valida la identidad del checkpoint y la correspondencia de clases."""
+    metadata = checkpoint.get("metadata")
+
+    if not isinstance(metadata, dict):
+        raise ValueError(
+            "El checkpoint no contiene metadatos válidos."
+        )
+
+    if metadata.get("experiment_id") != run.experiment_id:
+        raise ValueError(
+            "El checkpoint no coincide con el experimento."
+        )
+
+    if metadata.get("run_id") != run.run_id:
+        raise ValueError(
+            "El checkpoint no coincide con la ejecución."
+        )
+
+    class_names_guardados = checkpoint.get("class_names")
+    num_classes = checkpoint.get("num_classes")
+    class_to_idx = checkpoint.get("class_to_idx")
+
+    if (
+        not isinstance(class_names_guardados, (list, tuple))
+        or not class_names_guardados
+        or any(
+            not isinstance(name, str) or not name
+            for name in class_names_guardados
+        )
+    ):
+        raise ValueError(
+            "Las clases del checkpoint no son válidas."
+        )
+
+    class_names = tuple(class_names_guardados)
+
+    if len(set(class_names)) != len(class_names):
+        raise ValueError(
+            "El checkpoint contiene nombres de clases duplicados."
+        )
+
+    if (
+        not isinstance(num_classes, int)
+        or isinstance(num_classes, bool)
+        or num_classes <= 0
+        or len(class_names) != num_classes
+    ):
+        raise ValueError(
+            "La cantidad de clases del checkpoint no es válida."
+        )
+
+    if class_names != tuple(config.class_names):
+        raise ValueError(
+            "Las clases del checkpoint no coinciden con la configuración."
+        )
+
+    expected_class_to_idx = {
+        name: index
+        for index, name in enumerate(config.class_names)
+    }
+
+    if class_to_idx != expected_class_to_idx:
+        raise ValueError(
+            "El mapeo de clases del checkpoint no coincide con la configuración."
+        )
+
+    return class_names, num_classes
+
+
+def _seleccionar_dispositivo(device_solicitado: str) -> torch.device:
+    """Selecciona el dispositivo disponible para la evaluación."""
+    if device_solicitado == "cpu":
+        return torch.device("cpu")
+
+    if device_solicitado == "cuda":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+
+        # Si se solicitó CUDA y no está disponible, usamos CPU.
+        return torch.device("cpu")
+
+    # Para configuraciones como "auto", elegimos el dispositivo disponible.
+    return torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu"
+    )
 
 
 def evaluar_ejecucion(
@@ -114,16 +214,22 @@ def evaluar_ejecucion(
     service = ExperimentService(root)
 
     run: RunRecord = service.get_run(run_id)
+
     if run.status != "completed":
         raise ValueError(
             f"La ejecución {run_id!r} no está completada: {run.status!r}."
         )
+
     if not run.checkpoint_path:
-        raise ValueError("La ejecución no tiene un checkpoint asociado.")
+        raise ValueError(
+            "La ejecución no tiene un checkpoint asociado."
+        )
 
     checkpoint_path = Path(run.checkpoint_path)
+
     if not checkpoint_path.is_absolute():
         checkpoint_path = root / checkpoint_path
+
     checkpoint_path = checkpoint_path.resolve()
 
     if not checkpoint_path.is_file():
@@ -133,151 +239,214 @@ def evaluar_ejecucion(
 
     spec = service.get_experiment(run.experiment_id)
 
-    # El resultado se guarda en results/experiments/<experiment_id>/<run_id>.
     output_path = (
-        root / "results" / "experiments"
-        / run.experiment_id / run.run_id / "evaluation.json"
+        root
+        / "results"
+        / "experiments"
+        / run.experiment_id
+        / run.run_id
+        / "evaluation.json"
     )
+
     if output_path.exists() and not overwrite:
         raise FileExistsError(
-            f"Ya existe {output_path}. Usá overwrite=True para reemplazarlo."
+            f"Ya existe {output_path}. "
+            "Usá overwrite=True para reemplazarlo."
         )
 
-    device_solicitado = _configuracion_del_checkpoint(
-        torch.load(
-            checkpoint_path,
-            map_location="cpu",
-            weights_only=False,
-        ),
-        service.get_experiment(run.experiment_id),
-    ).device
-
-    if device_solicitado == "cpu":
-        device = torch.device("cpu")
-    elif device_solicitado == "cuda" and torch.cuda.is_available():
-        device = torch.device("cuda")
-    else:
-        # auto elige el dispositivo disponible. Si se solicitó CUDA
-        # pero no está disponible, la evaluación puede ejecutarse en CPU.
-        device = torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu"
-        )
-
+    # Se carga el checkpoint una sola vez.
+    # weights_only=False presupone un checkpoint propio y confiable.
     checkpoint = torch.load(
         checkpoint_path,
         map_location="cpu",
         weights_only=False,
     )
 
-    metadata = checkpoint.get("metadata") or {}
-    if metadata.get("experiment_id") != run.experiment_id:
-        raise ValueError("El checkpoint no coincide con el experimento.")
-    if metadata.get("run_id") != run.run_id:
-        raise ValueError("El checkpoint no coincide con la ejecución.")
-
-    config = _configuracion_del_checkpoint(checkpoint, spec)
-
-    if config.device == "cpu":
-        device = torch.device("cpu")
-    elif config.device == "cuda" and torch.cuda.is_available():
-        device = torch.device("cuda")
-    else:
-        # auto usa el dispositivo disponible.
-        # Si se pidió CUDA y no está disponible, evaluación usa CPU.
-        device = torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu"
+    if not isinstance(checkpoint, dict):
+        raise ValueError(
+            "El contenido del checkpoint no tiene el formato esperado."
         )
 
-
-    metadata = checkpoint.get("metadata") or {}
-    if metadata.get("experiment_id") != run.experiment_id:
-        raise ValueError("El checkpoint no coincide con el experimento.")
-    if metadata.get("run_id") != run.run_id:
-        raise ValueError("El checkpoint no coincide con la ejecución.")
-
     config = _configuracion_del_checkpoint(checkpoint, spec)
-    class_names = tuple(checkpoint.get("class_names", ()))
-    num_classes = int(checkpoint.get("num_classes", 0))
 
-    if not class_names or len(class_names) != num_classes:
-        raise ValueError("Las clases del checkpoint no son válidas.")
+    class_names, num_classes = _validar_checkpoint(
+        checkpoint,
+        run,
+        config,
+    )
+
+    device = _seleccionar_dispositivo(config.device)
 
     source_assignments = [
-        dataset for dataset in spec.datasets if dataset.role != "unused"
+        dataset
+        for dataset in spec.datasets
+        if dataset.role != "unused"
     ]
-    if not source_assignments:
-        raise ValueError("No hay fuentes activas para evaluar.")
 
-    source_names = [dataset.source_name for dataset in source_assignments]
-    path_overrides = {dataset.source_name: dataset.path for dataset in source_assignments}
+    if not source_assignments:
+        raise ValueError(
+            "No hay fuentes activas para evaluar."
+        )
+
+    source_names = [
+        dataset.source_name
+        for dataset in source_assignments
+    ]
+
+    path_overrides = {
+        dataset.source_name: dataset.path
+        for dataset in source_assignments
+    }
+
     paths = ProjectPaths(root)
+
     prepared = prepare_sources(
-        paths, config, requested_sources=source_names,
-        path_overrides=path_overrides, create_missing_splits=False,
+        paths,
+        config,
+        requested_sources=source_names,
+        path_overrides=path_overrides,
+        create_missing_splits=False,
         regenerate_splits=False,
     )
 
     architecture = checkpoint.get("architecture")
+
     if not architecture:
-        raise ValueError("El checkpoint no declara la arquitectura.")
+        raise ValueError(
+            "El checkpoint no declara la arquitectura."
+        )
+
     model = crear_modelo(
-        architecture, num_classes=num_classes, pretrained=False, dispositivo=device
+        architecture,
+        num_classes=num_classes,
+        pretrained=False,
+        dispositivo=device,
     )
-    model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+
+    if "model_state_dict" not in checkpoint:
+        raise ValueError(
+            "El checkpoint no contiene model_state_dict."
+        )
+
+    model.load_state_dict(
+        checkpoint["model_state_dict"],
+        strict=True,
+    )
     model.eval()
 
     transform = build_eval_transform(config=config)
+
     tests: dict[str, dict] = {}
     external_evaluations: dict[str, dict] = {}
+
+    criterion = nn.CrossEntropyLoss(reduction="sum")
+
     for assignment in source_assignments:
         name = assignment.source_name
-        dataset = subset_for(prepared[name], "test", transform)
-        loader = DataLoader(
-            dataset, batch_size=config.batch_size, shuffle=False,
-            num_workers=config.num_workers,
-            pin_memory=config.pin_memory and device.type == "cuda",
+
+        dataset = subset_for(
+            prepared[name],
+            "test",
+            transform,
         )
-        confusion = torch.zeros((num_classes, num_classes), dtype=torch.int64)
-        criterion = nn.CrossEntropyLoss(reduction="sum")
+
+        loader = DataLoader(
+            dataset,
+            batch_size=config.batch_size,
+            shuffle=False,
+            num_workers=config.num_workers,
+            pin_memory=(
+                config.pin_memory
+                and device.type == "cuda"
+            ),
+        )
+
+        confusion = torch.zeros(
+            (num_classes, num_classes),
+            dtype=torch.int64,
+        )
+
         total_loss = 0.0
         total_correct = 0
         total = 0
+
         with torch.inference_mode():
             for images, labels in loader:
                 images = images.to(device)
                 labels = labels.to(device)
+
                 logits = model(images)
-                if logits.ndim != 2 or logits.shape[1] != num_classes:
-                    raise ValueError("La salida del modelo no coincide con las clases.")
-                total_loss += criterion(logits, labels).item()
+
+                if (
+                    logits.ndim != 2
+                    or logits.shape[1] != num_classes
+                ):
+                    raise ValueError(
+                        "La salida del modelo no coincide con las clases."
+                    )
+
+                total_loss += criterion(
+                    logits,
+                    labels,
+                ).item()
+
                 predictions = logits.argmax(dim=1)
-                total_correct += (predictions == labels).sum().item()
+
+                total_correct += (
+                    predictions == labels
+                ).sum().item()
+
                 total += labels.numel()
-                encoded = labels * num_classes + predictions
+
+                encoded = (
+                    labels * num_classes + predictions
+                )
+
                 confusion += torch.bincount(
-                    encoded, minlength=num_classes * num_classes
-                ).reshape(num_classes, num_classes).cpu()
+                    encoded,
+                    minlength=num_classes * num_classes,
+                ).reshape(
+                    num_classes,
+                    num_classes,
+                ).cpu()
+
         if total == 0:
-            raise ValueError(f"La partición test de '{name}' está vacía.")
+            raise ValueError(
+                f"La partición test de '{name}' está vacía."
+            )
 
         tp = confusion.diag().double()
         support = confusion.sum(dim=1).double()
         predicted_count = confusion.sum(dim=0).double()
+
         precision = torch.where(
-            predicted_count > 0, tp / predicted_count.clamp(min=1),
+            predicted_count > 0,
+            tp / predicted_count.clamp(min=1),
             torch.zeros_like(tp),
         )
+
         recall = torch.where(
-            support > 0, tp / support.clamp(min=1), torch.zeros_like(tp)
+            support > 0,
+            tp / support.clamp(min=1),
+            torch.zeros_like(tp),
         )
+
         f1 = torch.where(
             precision + recall > 0,
-            2 * precision * recall / (precision + recall).clamp(min=1e-15),
+            2 * precision * recall
+            / (precision + recall).clamp(min=1e-15),
             torch.zeros_like(tp),
         )
-        weighted_f1 = (f1 * support).sum().item() / support.sum().item()
+
+        weighted_f1 = (
+            (f1 * support).sum().item()
+            / support.sum().item()
+        )
+
         per_source = {
-            "source": name, "role": assignment.role, "partition": "test",
+            "source": name,
+            "role": assignment.role,
+            "partition": "test",
             "num_samples": total,
             "metrics": {
                 "loss": total_loss / total,
@@ -293,21 +462,40 @@ def evaluar_ejecucion(
                     "precision": precision[index].item(),
                     "recall": recall[index].item(),
                     "f1": f1[index].item(),
-                } for index, class_name in enumerate(class_names)
+                }
+                for index, class_name in enumerate(class_names)
             },
             "confusion_matrix": confusion.tolist(),
         }
-        target = external_evaluations if assignment.role == "external_eval" else tests
+
+        target = (
+            external_evaluations
+            if assignment.role == "external_eval"
+            else tests
+        )
+
         target[name] = per_source
 
     resultado = {
-        "experiment_id": run.experiment_id, "run_id": run.run_id,
-        "model": checkpoint["model"], "architecture": architecture,
+        "experiment_id": run.experiment_id,
+        "run_id": run.run_id,
+        "model": checkpoint.get("model"),
+        "architecture": architecture,
         "checkpoint_path": paths.relative_to_root(checkpoint_path),
         "requested_device": config.device,
-        "device": str(device), "num_classes": num_classes,
-        "tests": tests, "external_evaluations": external_evaluations,
+        "device": str(device),
+        "num_classes": num_classes,
+        "tests": tests,
+        "external_evaluations": external_evaluations,
     }
-    _guardar_json_atomico(output_path, resultado)
-    resultado["evaluation_path"] = paths.relative_to_root(output_path)
+
+    _guardar_json_atomico(
+        output_path,
+        resultado,
+    )
+
+    resultado["evaluation_path"] = paths.relative_to_root(
+        output_path
+    )
+
     return resultado

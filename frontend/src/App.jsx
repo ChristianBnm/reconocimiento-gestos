@@ -18,6 +18,22 @@ const ROLE_LABELS = {
   unused: "No utilizar",
 };
 
+const RUN_STATUS_LABELS = {
+  pending: "Pendiente",
+  running: "En ejecución",
+  completed: "Completada",
+  failed: "Fallida",
+  cancelled: "Cancelada",
+};
+
+const ACTIVE_RUN_STATUSES = new Set(["pending", "running"]);
+
+function formatDate(value) {
+  if (!value) return "—";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString("es-AR");
+}
+
 async function request(path, options = {}) {
   const response = await fetch(`${API}${path}`, {
     ...options,
@@ -76,14 +92,77 @@ function App() {
   const [experiments, setExperiments] = useState([]);
   const [models, setModels] = useState([]);
   const [sources, setSources] = useState([]);
+  const [runs, setRuns] = useState([]);
+  const [runHistories, setRunHistories] = useState({});
+  const [runsError, setRunsError] = useState("");
+  const [runsLoading, setRunsLoading] = useState(false);
+  const [launchingId, setLaunchingId] = useState(null);
+  const [hoveredActiveRunId, setHoveredActiveRunId] = useState(null);
+  const [cancellingRunId, setCancellingRunId] = useState(null);
+  const [cancellationRequestedIds, setCancellationRequestedIds] = useState(() => new Set());
   const [error, setError] = useState("");
   const [formError, setFormError] = useState("");
   const [success, setSuccess] = useState("");
   const [showForm, setShowForm] = useState(false);
   const [saving, setSaving] = useState(false);
   const [deletingId, setDeletingId] = useState(null);
+  const [evaluatingRunId, setEvaluatingRunId] = useState(null);
+  const [selectedEvaluation, setSelectedEvaluation] = useState(null);
+  const [evaluationError, setEvaluationError] = useState("");
 
   const [form, setForm] = useState(INITIAL_FORM);
+
+  const loadRuns = useCallback(async () => {
+    try {
+      const data = await request("/runs");
+      const items = Array.isArray(data) ? data : data?.runs ?? [];
+      const ordered = [...items].sort(
+        (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
+      );
+
+      setRuns(ordered);
+      setRunsError("");
+
+      const activeRunIds = new Set(
+        ordered
+          .filter((run) => ACTIVE_RUN_STATUSES.has(run.status))
+          .map((run) => run.run_id),
+      );
+      setCancellationRequestedIds((current) => {
+        const stillPending = [...current].filter((id) => activeRunIds.has(id));
+        return new Set(stillPending);
+      });
+
+      // history.json se actualiza al terminar cada época. Si todavía no existe,
+      // la ejecución simplemente se muestra sin métricas de progreso.
+      const terminalRunsWithHistory = new Set(["completed", "failed", "cancelled"]);
+      const historyTargets = [
+        ...ordered.filter((run) => ACTIVE_RUN_STATUSES.has(run.status)),
+        ...ordered.filter((run) => terminalRunsWithHistory.has(run.status)).slice(0, 5),
+      ];
+
+      await Promise.all(
+        historyTargets.map(async (run) => {
+          try {
+            const historyData = await request(
+              `/runs/${encodeURIComponent(run.run_id)}/history`,
+            );
+            const history = Array.isArray(historyData)
+              ? historyData
+              : historyData?.history ?? [];
+            setRunHistories((current) => ({
+              ...current,
+              [run.run_id]: history,
+            }));
+          } catch {
+            // Es normal que aún no exista history.json antes de la primera época.
+          }
+        }),
+      );
+    } catch (err) {
+      setRunsError(err.message);
+    }
+  }, []);
 
   const loadDashboard = useCallback(async () => {
     setError("");
@@ -114,15 +193,29 @@ function App() {
           ? sourceData
           : sourceData?.sources ?? [],
       );
+
+      await loadRuns();
     } catch (err) {
       setHealth("error");
       setError(err.message);
     }
-  }, []);
+  }, [loadRuns]);
 
   useEffect(() => {
     loadDashboard();
   }, [loadDashboard]);
+
+  const hasActiveRun = runs.some((run) => ACTIVE_RUN_STATUSES.has(run.status));
+
+  useEffect(() => {
+    if (!hasActiveRun) return undefined;
+
+    const intervalId = window.setInterval(() => {
+      loadRuns();
+    }, 5000);
+
+    return () => window.clearInterval(intervalId);
+  }, [hasActiveRun, loadRuns]);
 
   function updateForm(event) {
     const { name, value } = event.target;
@@ -142,11 +235,7 @@ function App() {
 
   async function createExperiment(event) {
     event.preventDefault();
-    setForm({
-      ...INITIAL_FORM,
-      model_name: models[0]?.name ?? "",
-      source_name: sources[0]?.name ?? "",
-    });
+    setFormError("");
     setSuccess("");
 
     if (!form.name.trim()) {
@@ -224,11 +313,9 @@ function App() {
       setSuccess(`Experimento creado: ${created.experiment_id}`);
       setShowForm(false);
       setForm({
-        name: "",
-        description: "",
+        ...INITIAL_FORM,
         model_name: models[0]?.name ?? "",
         source_name: sources[0]?.name ?? "",
-        role: "train_source",
       });
     } catch (err) {
       setFormError(err.message);
@@ -238,12 +325,140 @@ function App() {
 
   }
 
+  async function refreshRuns() {
+    setRunsLoading(true);
+    try {
+      await loadRuns();
+    } finally {
+      setRunsLoading(false);
+    }
+  }
+
+  async function startRun(experiment) {
+    const experimentId = experiment?.experiment_id;
+    if (!experimentId) return;
+
+    if (hasActiveRun) {
+      setError("Ya hay un entrenamiento en curso. Esperá a que finalice antes de iniciar otro.");
+      return;
+    }
+
+    setLaunchingId(experimentId);
+    setError("");
+    setSuccess("");
+
+    try {
+      const created = await request(
+        `/experiments/${encodeURIComponent(experimentId)}/runs`,
+        { method: "POST" },
+      );
+
+      setRuns((current) => [
+        created,
+        ...current.filter((run) => run.run_id !== created.run_id),
+      ]);
+      setSuccess(`Entrenamiento iniciado: ${created.run_id}`);
+      await loadRuns();
+    } catch (err) {
+      setError(`No se pudo iniciar ${experimentId}: ${err.message}`);
+    } finally {
+      setLaunchingId(null);
+    }
+  }
+
+  async function evaluateRun(run) {
+  if (!run?.run_id || run.status !== "completed") return;
+
+  setEvaluatingRunId(run.run_id);
+  setEvaluationError("");
+  setError("");
+  setSuccess("");
+
+  try {
+    // Ejecutar la evaluación mediante FastAPI.
+    await request(
+      `/runs/${encodeURIComponent(run.run_id)}/evaluate`,
+      { method: "POST" }
+    );
+
+    // Recuperar las métricas y la matriz de confusión generadas.
+    const results = await request(
+      `/runs/${encodeURIComponent(run.run_id)}/results`
+    );
+
+    setSelectedEvaluation({
+      runId: run.run_id,
+      results,
+    });
+
+    setSuccess(`Evaluación completada: ${run.run_id}`);
+
+    // Llevar al usuario a la sección de resultados.
+    document.getElementById("evaluation-results")?.scrollIntoView({
+      behavior: "smooth",
+      block: "start",
+    });
+  } catch (err) {
+    setEvaluationError(
+      `No se pudo evaluar ${run.run_id}: ${err.message}`
+    );
+  } finally {
+    setEvaluatingRunId(null);
+  }
+}
+
+  async function cancelRun(run) {
+    if (!run?.run_id || !ACTIVE_RUN_STATUSES.has(run.status)) return;
+
+    const confirmed = window.confirm(
+      `¿Detener el entrenamiento ${run.run_id}?\n\n` +
+        "La ejecución quedará marcada como cancelada. Se conservará el historial de épocas ya completadas."
+    );
+    if (!confirmed) return;
+
+    setCancellingRunId(run.run_id);
+    setError("");
+    setSuccess("");
+    try {
+      await request(`/runs/${encodeURIComponent(run.run_id)}/cancel`, {
+        method: "POST",
+      });
+      setCancellationRequestedIds((current) => {
+        const next = new Set(current);
+        next.add(run.run_id);
+        return next;
+      });
+      setSuccess(
+        `Solicitud de detención enviada para ${run.run_id}. ` +
+          "Se marcará como cancelada cuando finalice el paso de entrenamiento en curso.",
+      );
+      await loadRuns();
+    } catch (err) {
+      setError(`No se pudo detener ${run.run_id}: ${err.message}`);
+    } finally {
+      setCancellingRunId(null);
+      setHoveredActiveRunId(null);
+    }
+  }
+
   async function deleteExperiment(experiment) {
     const { experiment_id, name } = experiment;
 
+    if (runsError) {
+      setError("No se puede verificar el historial de ejecuciones. Actualizá los datos e intentá nuevamente.");
+      return;
+    }
+
+    if (runs.some((run) => run.experiment_id === experiment_id)) {
+      setError(
+        `No se puede eliminar ${experiment_id}: tiene ejecuciones asociadas. El historial se conserva.`,
+      );
+      return;
+    }
+
     const confirmed = window.confirm(
       `¿Querés eliminar el experimento "${name}" (${experiment_id})?\n\n` +
-        "Esta acción no se puede deshacer."
+        "Solo se eliminará la configuración. Los experimentos con ejecuciones asociadas no se pueden eliminar para conservar su historial."
     );
 
     if (!confirmed) return;
@@ -702,18 +917,79 @@ function App() {
                         </code>
                       </td>
                       <td>
-                        <button
-                          type="button"
-                          className="secondary-button"
-                          disabled={
-                            !experiment.experiment_id || deletingId !== null
-                          }
-                          onClick={() => deleteExperiment(experiment)}
-                        >
-                          {deletingId === experiment.experiment_id
-                            ? "Eliminando..."
-                            : "Eliminar"}
+                        <div className="panel-actions">
+                          {(() => {
+                            const activeRun = runs.find(
+                              (run) =>
+                                run.experiment_id === experiment.experiment_id &&
+                                ACTIVE_RUN_STATUSES.has(run.status),
+                            );
+                            const isHovered = activeRun && hoveredActiveRunId === activeRun.run_id;
+                            const isCancelling = activeRun && (
+                              cancellingRunId === activeRun.run_id ||
+                              cancellationRequestedIds.has(activeRun.run_id)
+                            );
+                            return (
+                              <button
+                                type="button"
+                                className={activeRun ? "secondary-button" : "primary-button"}
+                                disabled={
+                                  !experiment.experiment_id ||
+                                  (hasActiveRun && !activeRun) ||
+                                  launchingId !== null ||
+                                  Boolean(isCancelling)
+                                }
+                                onMouseEnter={() => activeRun && setHoveredActiveRunId(activeRun.run_id)}
+                                onMouseLeave={() => setHoveredActiveRunId(null)}
+                                onClick={() => activeRun ? cancelRun(activeRun) : startRun(experiment)}
+                                title={activeRun ? "Detener este entrenamiento" : hasActiveRun ? "Hay otro entrenamiento en curso" : "Iniciar entrenamiento con esta configuración"}
+                                style={activeRun && isHovered ? { background: "#b91c1c", color: "#ffffff", borderColor: "#b91c1c" } : undefined}
+                              >
+                                {launchingId === experiment.experiment_id
+                                  ? "Iniciando..."
+                                  : isCancelling
+                                    ? "Deteniendo..."
+                                    : activeRun
+                                      ? isHovered ? "Detener" : "Ejecución activa"
+                                      : hasActiveRun
+                                        ? "Ejecución activa"
+                                        : "Ejecutar"}
+                              </button>
+                            );
+                          })()}
+                          <button
+                            type="button"
+                            className="secondary-button"
+                            disabled={
+                              !experiment.experiment_id ||
+                              deletingId !== null ||
+                              Boolean(runsError) ||
+                              runs.some(
+                                (run) => run.experiment_id === experiment.experiment_id,
+                              )
+                            }
+                            title={
+                              runsError
+                                ? "No se puede verificar el historial de ejecuciones."
+                                : runs.some(
+                                    (run) => run.experiment_id === experiment.experiment_id,
+                                  )
+                                  ? "No se puede eliminar: el experimento tiene ejecuciones asociadas y su historial se conserva."
+                                  : "Eliminar experimento"
+                            }
+                            onClick={() => deleteExperiment(experiment)}
+                          >
+                            {deletingId === experiment.experiment_id
+                              ? "Eliminando..."
+                              : runsError
+                                ? "Historial no disponible"
+                                : runs.some(
+                                    (run) => run.experiment_id === experiment.experiment_id,
+                                  )
+                                  ? "Con historial"
+                                  : "Eliminar"}
                           </button>
+                        </div>
                       </td>
                     </tr>
                   ))}
@@ -743,15 +1019,303 @@ function App() {
               <h2>Ejecuciones recientes</h2>
               <p>Seguimiento de los entrenamientos realizados.</p>
             </div>
+            <div className="panel-actions">
+              <span className="count-badge">{runs.length} total</span>
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={refreshRuns}
+                disabled={runsLoading}
+              >
+                {runsLoading ? "Actualizando..." : "Actualizar"}
+              </button>
+            </div>
           </div>
 
-          <div className="empty-state compact">
-            <p>
-              La consulta de ejecuciones y sus métricas será el próximo paso
-              de integración.
+          {runsError && (
+            <div className="error-banner">
+              No se pudieron cargar las ejecuciones: {runsError}
+            </div>
+          )}
+
+          {runs.length > 0 ? (
+            <div className="table-wrapper">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Estado</th>
+                    <th>Experimento</th>
+                    <th>Modelo</th>
+                    <th>Progreso</th>
+                    <th>Creada</th>
+                    <th>ID de ejecución</th>
+                    <th>Acciones</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {runs.map((run) => {
+                    const experiment = experiments.find(
+                      (item) => item.experiment_id === run.experiment_id,
+                    );
+                    const history = runHistories[run.run_id] ?? [];
+                    const latestEpoch = history[history.length - 1];
+                    const expectedEpochs = Number(
+                      experiment?.parameters?.epochs ?? 0,
+                    );
+
+                    return (
+                      <tr key={run.run_id}>
+                        <td>
+                          <strong>{RUN_STATUS_LABELS[run.status] ?? run.status}</strong>
+                          {run.error_message && (
+                            <div className="resource-detail">{run.error_message}</div>
+                          )}
+                        </td>
+                        <td>
+                          {experiment?.name ?? run.experiment_id}
+                          <div className="resource-detail">{run.experiment_id}</div>
+                        </td>
+                        <td>{experiment?.model_name ?? "—"}</td>
+                        <td>
+                          {latestEpoch
+                            ? `Época ${latestEpoch.epoch}${expectedEpochs ? ` / ${expectedEpochs}` : ""}`
+                            : ACTIVE_RUN_STATUSES.has(run.status)
+                              ? "Preparando entrenamiento..."
+                              : "—"}
+                          {latestEpoch && (
+                            <div className="resource-detail">
+                              Val. accuracy: {(latestEpoch.val_accuracy * 100).toFixed(2)}%
+                            </div>
+                          )}
+                        </td>
+                        <td>{formatDate(run.created_at)}</td>
+                        <td>
+                          <code>{run.run_id}</code>
+                        </td>
+
+                        <td>
+                          {run.status === "completed" ? (
+                            <button
+                              type="button"
+                              className="primary-button"
+                              onClick={() => evaluateRun(run)}
+                              disabled={evaluatingRunId !== null}
+                            >
+                              {evaluatingRunId === run.run_id
+                              ? "Evaluando..."
+                              : "Evaluar"}
+                            </button>
+                          ) : (
+                            <span className="resource-detail">
+                              No disponible
+                            </span>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <div className="empty-state compact">
+              <p>
+                {runsError
+                  ? "Revisá la conexión con la API para consultar las ejecuciones."
+                  : "Todavía no hay ejecuciones. Usá Ejecutar en un experimento para iniciar el primer entrenamiento."}
+              </p>
+            </div>
+          )}
+          {hasActiveRun && (
+            <p className="form-note">
+              Hay un entrenamiento activo. Los estados y las métricas se actualizan automáticamente cada 5 segundos.
             </p>
-          </div>
+          )}
         </section>
+
+        {evaluationError && (
+          <div className="error-banner" role="alert">
+            {evaluationError}
+          </div>
+        )}
+
+        {selectedEvaluation && (() => {
+          const result = selectedEvaluation.results;
+
+          // La API devuelve las evaluaciones agrupadas por fuente.
+          const tests = result?.tests ?? {};
+
+          // Priorizar la fuente original; utilizar otra disponible
+          // como alternativa.
+          const test =
+            tests.original ??
+            Object.values(tests)[0] ??
+            null;
+
+          const metrics = test?.metrics ?? {};
+
+          const matrix = test?.confusion_matrix ?? [];
+          const classNames = Object.keys(test?.per_class ?? {});
+          const resources = [
+            ["Modelo", result?.model ?? "—"],
+            ["Arquitectura", result?.architecture ?? "—"],
+            ["Dispositivo solicitado", result?.requested_device ?? "—"],
+            ["Dispositivo utilizado", result?.device ?? "—"],
+            ["Checkpoint", result?.checkpoint_path ?? "—"],
+            ["Partición evaluada", test?.partition ?? "—"],
+            ["Muestras evaluadas", test?.num_samples ?? "—"],
+          ];
+
+          const formatMetric = (value) => {
+            if (value == null || !Number.isFinite(Number(value))) {
+              return "—";
+            }
+
+            const number = Number(value);
+            return `${(number * 100).toFixed(2)}%`;
+          };
+
+          const metricCards = [
+            {
+              label: "Accuracy",
+              value: metrics.accuracy,
+            },
+            {
+              label: "F1 macro",
+              value: metrics.f1_macro ?? metrics.macro_f1,
+            },
+            {
+              label: "Precisión macro",
+              value: metrics.precision_macro,
+            },
+            {
+              label: "Recall macro",
+              value: metrics.recall_macro,
+            },
+          ];
+
+          return (
+            <section
+              className="content-panel"
+              id="evaluation-results"
+            >
+              <div className="panel-heading">
+                <div>
+                  <h2>Resultados de evaluación</h2>
+                  <p>
+                    Ejecución: {selectedEvaluation.runId}
+                  </p>
+                </div>
+
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={() => setSelectedEvaluation(null)}
+                >
+                  Cerrar
+                </button>
+              </div>
+
+              <div className="evaluation-grid">
+                {metricCards.map((metric) => (
+                  <article
+                    className="stat-card"
+                    key={metric.label}
+                  >
+                    <span className="stat-label">
+                      {metric.label}
+                    </span>
+                    <strong>
+                      {formatMetric(metric.value)}
+                    </strong>
+                  </article>
+                ))}
+              </div>
+
+              <div className="evaluation-details">
+                <h3>Métricas adicionales</h3>
+
+                <p>
+                  <strong>Loss:</strong>{" "}
+                  {Number.isFinite(Number(metrics.loss))
+                    ? Number(metrics.loss).toFixed(5)
+                    : "—"}
+                </p>
+
+                <p>
+                  <strong>Clases:</strong>{" "}
+                  {result?.num_classes ?? "—"}
+                </p>
+
+                <p>
+                  <strong>Dispositivo:</strong>{" "}
+                  {result?.device ?? "—"}
+                </p>
+
+                <h3>Matriz de confusión</h3>
+                <p className="resource-detail">
+                  Filas: clase real · Columnas: clase predicha.
+                </p>
+
+                {Array.isArray(matrix) && matrix.length > 0 ? (
+                  <div className="confusion-wrapper">
+                    <table className="confusion-matrix">
+                      <thead>
+                        <tr>
+                          <th className="matrix-axis-label">Real ↓ / Pred. →</th>
+                          {matrix.map((_, index) => (
+                            <th key={index} title={`Clase predicha: ${classNames[index] ?? index}`}>
+                              {classNames[index] ?? index}
+                            </th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {matrix.map((row, rowIndex) => (
+                          <tr key={rowIndex}>
+                            <th scope="row" title={`Clase real: ${classNames[rowIndex] ?? rowIndex}`}>
+                              {classNames[rowIndex] ?? rowIndex}
+                            </th>
+                            {row.map((value, colIndex) => (
+                              <td
+                                key={colIndex}
+                                className={
+                                  rowIndex === colIndex
+                                    ? "matrix-diagonal"
+                                    : value > 0
+                                      ? "matrix-error"
+                                      : ""
+                                }
+                                title={`Real: ${classNames[rowIndex] ?? rowIndex}; predicha: ${classNames[colIndex] ?? colIndex}; cantidad: ${value}`}
+                              >
+                                {value}
+                              </td>
+                            ))}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                ) : (
+                  <p className="resource-detail">
+                    La API no devolvió una matriz de confusión en el formato esperado.
+                  </p>
+                )}
+
+                <h3>Configuración y recursos utilizados</h3>
+                <div className="evaluation-resources">
+                  {resources.map(([label, value]) => (
+                    <div className="evaluation-resource" key={label}>
+                      <span>{label}</span>
+                      <strong>{String(value)}</strong>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </section>
+          );
+        })()}
+
 
         <section className="content-panel" id="resources">
           <div className="panel-heading">

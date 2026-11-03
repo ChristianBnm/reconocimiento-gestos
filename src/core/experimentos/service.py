@@ -1,15 +1,22 @@
 
 from __future__ import annotations
 
-import random
-import uuid
 from dataclasses import fields
 from pathlib import Path
+from threading import Event
 from typing import Any
-
-import numpy as np
-import torch
+from src.core.utils.io import load_json, save_json
 from torch.utils.data import ConcatDataset, DataLoader
+
+import time
+import uuid
+import torch
+import random
+import platform
+import numpy as np
+
+
+
 
 from src.core.configuracion.settings import (
     ExperimentConfig,
@@ -27,7 +34,7 @@ from src.core.dataset.transforms import (
     build_eval_transform,
     build_train_transform,
 )
-from src.core.entrenamiento.trainer import Trainer
+from src.core.entrenamiento.trainer import Trainer, TrainingCancelled
 from src.core.experimentos.registry import ExperimentRegistry
 from src.core.experimentos.schemas import (
     DATASET_ROLES,
@@ -94,7 +101,7 @@ class ExperimentService:
         return self.registry.load_experiment(experiment_id)
 
     def delete_experiment(self, experiment_id: str) -> None:
-        """Elimina un experimento sin ejecuciones asociadas."""
+        """Elimina la definición solo si no tiene ejecuciones asociadas."""
         self.registry.delete_experiment(experiment_id)
 
     def list_experiments(self) -> list[str]:
@@ -198,29 +205,6 @@ class ExperimentService:
             **spec.parameters,
         )
 
-
-    @staticmethod
-    def _resolve_device(config: ExperimentConfig) -> torch.device:
-        """Resuelve el dispositivo solicitado para el entrenamiento."""
-        requested_device = config.device
-
-        if requested_device == "auto":
-            return torch.device(
-                "cuda" if torch.cuda.is_available() else "cpu"
-            )
-
-        if requested_device == "cpu":
-            return torch.device("cpu")
-
-        if requested_device == "cuda":
-            if not torch.cuda.is_available():
-                raise RuntimeError(
-                    "Se solicitó el dispositivo 'cuda', pero CUDA "
-                    "no está disponible en este entorno."
-                )
-            return torch.device("cuda")
-
-
     @staticmethod
     def _make_loader(
         dataset,
@@ -253,6 +237,7 @@ class ExperimentService:
         self,
         experiment_id: str,
         run_id: str | None = None,
+        cancel_event: Event | None = None,
     ) -> RunRecord:
         """Ejecuta el entrenamiento y persiste el estado de la ejecución."""
         spec = self.get_experiment(experiment_id)
@@ -327,8 +312,9 @@ class ExperimentService:
                 create_missing_splits=True,
             )
 
-            device = self._resolve_device(config)
-
+            device = torch.device(
+                "cuda" if torch.cuda.is_available() else "cpu"
+            )
             model_spec = get_model_spec(spec.model_name)
             model = crear_modelo(
                 model_spec.architecture,
@@ -400,7 +386,6 @@ class ExperimentService:
                     name: dataset_fingerprint(prepared[name].dataset)
                     for name in active_source_names
                 },
-                "requested_device": config.device,
                 "device": str(device),
                 "torch_version": str(torch.__version__),
             }
@@ -426,8 +411,140 @@ class ExperimentService:
                 checkpoint_path=checkpoint_path,
                 history_path=history_path,
                 metadata=metadata,
+                cancel_event=cancel_event,
             )
+
+            
+            # Medición de recursos del entrenamiento.
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+                torch.cuda.reset_peak_memory_stats(device)
+
+            training_started = time.perf_counter()
             trainer.fit()
+
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+
+            training_seconds = time.perf_counter() - training_started
+
+            # No registrar métricas de éxito si se solicitó cancelar.
+            if cancel_event is not None and cancel_event.is_set():
+                raise TrainingCancelled(
+                    "El usuario solicitó detener el entrenamiento."
+                )
+
+            # Memoria RAM máxima del proceso según el sistema operativo.
+            try:
+                import resource
+
+                max_rss_raw = resource.getrusage(
+                    resource.RUSAGE_SELF
+                ).ru_maxrss
+
+                # Linux informa KiB; macOS informa bytes.
+                max_rss_mb = max_rss_raw / (
+                    1024 if platform.system() == "Linux"
+                    else 1024 * 1024
+                )
+            except (ImportError, AttributeError, OSError):
+                max_rss_mb = None
+
+            try:
+                checkpoint_mb = (
+                    checkpoint_path.stat().st_size / (1024 * 1024)
+                )
+            except OSError:
+                checkpoint_mb = None
+
+            epoch_history = (
+                load_json(history_path)
+                if history_path.is_file()
+                else []
+            )
+
+            trainable_parameters = sum(
+                p.numel()
+                for p in model.parameters()
+                if p.requires_grad
+            )
+            total_parameters = sum(
+                p.numel() for p in model.parameters()
+            )
+
+            resource_metrics = {
+                "experiment_id": spec.experiment_id,
+                "run_id": run_id,
+                "model": spec.model_name,
+                "device": str(device),
+                "gpu_name": (
+                    torch.cuda.get_device_name(device)
+                    if device.type == "cuda"
+                    else None
+                ),
+                "python_version": platform.python_version(),
+                "pytorch_version": str(torch.__version__),
+                "cuda_available": torch.cuda.is_available(),
+                "image_size": config.image_size,
+                "batch_size": config.batch_size,
+                "epochs_completed": len(epoch_history),
+                "training_time_seconds": round(training_seconds, 4),
+                "mean_epoch_time_seconds": (
+                    round(
+                        sum(
+                            row.get("epoch_seconds", 0.0)
+                            for row in epoch_history
+                        ) / len(epoch_history),
+                        4,
+                    )
+                    if epoch_history
+                    else None
+                ),
+                "max_process_ram_mb": (
+                    round(max_rss_mb, 2)
+                    if max_rss_mb is not None
+                    else None
+                ),
+                "gpu_peak_allocated_mb": (
+                    round(
+                        torch.cuda.max_memory_allocated(device)
+                        / (1024 * 1024),
+                        2,
+                    )
+                    if device.type == "cuda"
+                    else None
+                ),
+                "gpu_peak_reserved_mb": (
+                    round(
+                        torch.cuda.max_memory_reserved(device)
+                        / (1024 * 1024),
+                        2,
+                    )
+                    if device.type == "cuda"
+                    else None
+                ),
+                "parameters_total": total_parameters,
+                "parameters_trainable": trainable_parameters,
+                "checkpoint_size_mb": (
+                    round(checkpoint_mb, 3)
+                    if checkpoint_mb is not None
+                    else None
+                ),
+                "note_ram": (
+                    "Máximo RSS del proceso según el sistema operativo; "
+                    "no equivale a memoria exclusiva del modelo."
+                ),
+                "note_gpu_memory": (
+                    "Pico de memoria gestionada por el asignador de PyTorch; "
+                    "no incluye necesariamente todas las asignaciones "
+                    "externas a PyTorch."
+                ),
+            }
+
+            save_json(
+                resource_metrics,
+                artifact_root / "metricas_recursos_entrenamiento.json",
+            )
 
             if not checkpoint_path.is_file():
                 raise RuntimeError(
@@ -440,6 +557,18 @@ class ExperimentService:
                 checkpoint_path=self.paths.relative_to_root(checkpoint_path),
             )
 
+        except TrainingCancelled as exc:
+            try:
+                current = self.registry.load_run(run_id)
+                if current.experiment_id == spec.experiment_id and current.status in {"pending", "running"}:
+                    return self.registry.update_run_status(
+                        run_id,
+                        "cancelled",
+                        error_message=str(exc),
+                    )
+            except Exception:
+                raise
+            return self.registry.load_run(run_id)
         except Exception as exc:
             try:
                 current = self.registry.load_run(run_id)

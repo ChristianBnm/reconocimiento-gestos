@@ -1,4 +1,7 @@
 
+import json
+from pathlib import Path
+
 from fastapi import APIRouter, HTTPException
 
 from src.core.experimentos.evaluation import evaluar_ejecucion
@@ -32,11 +35,22 @@ def evaluate_run(run_id: str) -> dict:
         )
 
     try:
-        return evaluar_ejecucion(
-            PROJECT_ROOT,
-            run_id,
-            overwrite=True,
+        # Reutilizar los resultados si la ejecución ya fue evaluada.
+        results_root = (
+            Path(PROJECT_ROOT)
+            / "results"
+            / "experiments"
+            / run.experiment_id
+            / run_id
         )
+        evaluation_path = results_root / "evaluation.json"
+
+        if evaluation_path.exists():
+            with evaluation_path.open("r", encoding="utf-8") as file:
+                return json.load(file)
+
+        return evaluar_ejecucion(PROJECT_ROOT, run_id)
+
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except (ValueError, RuntimeError) as exc:
