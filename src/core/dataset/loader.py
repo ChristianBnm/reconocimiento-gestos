@@ -54,6 +54,7 @@ class GestosDataset(Dataset):
         source_names: Sequence[str] | None = None,
         require_all_classes: bool = True,
         deduplicate_exact_duplicates: bool = True,
+        excluded_paths: set[Path] | None = None,
     ) -> None:
         if isinstance(carpetas_imagenes, (str, Path)):
             carpetas_imagenes = [carpetas_imagenes]
@@ -69,6 +70,7 @@ class GestosDataset(Dataset):
                 raise NotADirectoryError(f"No es una carpeta: {root}")
 
         names = tuple(class_names) if class_names is not None else CLASS_NAMES
+
         if not names or len(set(names)) != len(names):
             raise ValueError("class_names debe ser una secuencia no vacía y sin duplicados.")
         self.clases = list(names)
@@ -85,6 +87,12 @@ class GestosDataset(Dataset):
         self.source_names = sources
         self.deduplicate_exact_duplicates = bool(deduplicate_exact_duplicates)
         self.excluded_duplicates: list[ExcludedDuplicate] = []
+
+        self.excluded_paths = {
+            Path(path).expanduser().resolve()
+            for path in (excluded_paths or set())
+        }
+
         self.records = self._scan_records(require_all_classes=require_all_classes)
         self.rutas_imagenes = [record.path for record in self.records]
         self.etiquetas = [record.label for record in self.records]
@@ -92,7 +100,10 @@ class GestosDataset(Dataset):
     def _scan_records(self, require_all_classes: bool) -> list[ImageRecord]:
         records: list[ImageRecord] = []
         per_class = {class_name: 0 for class_name in self.clases}
+
         first_by_source_hash: dict[tuple[str, str], ImageRecord] = {}
+        first_by_hash: dict[str, ImageRecord] = {}
+
         for root in self.carpetas_imagenes:
             unknown_dirs = []
             for child in root.iterdir():
@@ -110,6 +121,8 @@ class GestosDataset(Dataset):
                     + ". Agregá las etiquetas a clases.json o mové esas carpetas fuera del dataset."
                 )
 
+
+
         # Orden estable: vocabulario configurado, fuentes configuradas, nombre de archivo.
         for class_name in self.clases:
             label = self.class_to_idx[class_name]
@@ -118,21 +131,40 @@ class GestosDataset(Dataset):
                 if not class_dir.is_dir():
                     continue
                 for path in sorted(class_dir.iterdir(), key=lambda item: item.name.casefold()):
+
                     if not path.is_file() or path.suffix.casefold() not in IMAGE_EXTENSIONS:
                         continue
+
+                    if path.resolve() in self.excluded_paths:
+                        continue
+
                     raw = path.read_bytes()
+
                     group_id = hashlib.sha256(raw).hexdigest()
                     decoded = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
                     if decoded is None:
                         raise ValueError(f"Imagen ilegible o corrupta: {path}")
                     relative_path = path.relative_to(root).as_posix()
+
                     key = (source, group_id)
+                    # Validación global: un mismo contenido no puede tener etiquetas diferentes.
+                    previous_global = first_by_hash.get(group_id)
+
+                    if previous_global is not None and previous_global.label != label:
+                        raise ValueError(
+                        "Contenido idéntico asignado a clases distintas entre fuentes: "
+                        f"{previous_global.path} ({previous_global.class_name}) y "
+                        f"{path} ({class_name})."
+                    )
+
                     previous = first_by_source_hash.get(key)
+
                     if previous is not None and previous.label != label:
                         raise ValueError(
-                            "Contenido idéntico asignado a clases distintas dentro de una fuente: "
-                            f"{previous.path} ({previous.class_name}) y {path} ({class_name})."
-                        )
+                        "Contenido idéntico asignado a clases distintas dentro de una fuente: "
+                        f"{previous.path} ({previous.class_name}) y {path} ({class_name})."
+                    )
+
                     if previous is not None and self.deduplicate_exact_duplicates:
                         self.excluded_duplicates.append(
                             ExcludedDuplicate(
@@ -155,8 +187,10 @@ class GestosDataset(Dataset):
                         relative_path=relative_path,
                         group_id=group_id,
                     )
+
                     records.append(record)
                     first_by_source_hash.setdefault(key, record)
+                    first_by_hash.setdefault(group_id, record)
                     per_class[class_name] += 1
 
         if not records:

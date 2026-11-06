@@ -8,6 +8,7 @@ import statistics
 from pathlib import Path
 
 from src.core.experimentos.benchmark import benchmark_ejecucion
+from src.core.experimentos.evaluation import _guardar_json_atomico
 
 
 def repetir_benchmark(
@@ -17,8 +18,10 @@ def repetir_benchmark(
     repeticiones: int = 5,
     warmup_batches: int = 5,
 ) -> dict:
-    if repeticiones < 3:
-        raise ValueError("Usá al menos 3 repeticiones.")
+    if (not isinstance(repeticiones, int) or isinstance(repeticiones, bool) or repeticiones < 3):
+        raise ValueError(
+            "La cantidad de repeticiones debe ser un entero de al menos 3."
+        )
 
     root = Path(root).expanduser().resolve()
     resultados = []
@@ -38,6 +41,31 @@ def repetir_benchmark(
             "repeticion": numero,
             **resultado,
         })
+
+    campos_consistencia = (
+        "experiment_id",
+        "model",
+        "architecture",
+        "device",
+        "partition",
+        "num_samples",
+        "batch_size",
+    )
+
+    referencia = resultados[0]
+
+    for resultado in resultados[1:]:
+        diferencias = [
+            campo
+            for campo in campos_consistencia
+            if resultado[campo] != referencia[campo]
+        ]
+
+        if diferencias:
+            raise ValueError(
+                "Las mediciones no son comparables. "
+                f"Diferencias en: {', '.join(diferencias)}."
+            )
 
     metricas = (
         "model_inference_seconds",
@@ -74,11 +102,8 @@ def repetir_benchmark(
         / resultados[0]["experiment_id"]
         / run_id / "benchmark_repeticiones.json"
     )
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(
-        json.dumps(salida, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+
+    _guardar_json_atomico(output_path, salida)
 
     print(json.dumps({
         "model": salida["model"],

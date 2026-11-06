@@ -74,8 +74,7 @@ const INITIAL_FORM = {
   name: "",
   description: "",
   model_name: "",
-  source_name: "",
-  role: "train_source",
+  datasets: [],
   device: "auto",
   image_size: 224,
   batch_size: 32,
@@ -85,6 +84,9 @@ const INITIAL_FORM = {
   patience: 5,
   seed: 42,
   freeze_backbone: true,
+  train_percent: 70,
+  validation_percent: 15,
+  test_percent: 15,
 };
 
 function App() {
@@ -92,6 +94,7 @@ function App() {
   const [experiments, setExperiments] = useState([]);
   const [models, setModels] = useState([]);
   const [sources, setSources] = useState([]);
+  const [invalidSources, setInvalidSources] = useState([]);
   const [runs, setRuns] = useState([]);
   const [runHistories, setRunHistories] = useState({});
   const [runsError, setRunsError] = useState("");
@@ -108,7 +111,9 @@ function App() {
   const [deletingId, setDeletingId] = useState(null);
   const [evaluatingRunId, setEvaluatingRunId] = useState(null);
   const [selectedEvaluation, setSelectedEvaluation] = useState(null);
+  const [selectedTestKey, setSelectedTestKey] = useState("original");
   const [evaluationError, setEvaluationError] = useState("");
+
 
   const [form, setForm] = useState(INITIAL_FORM);
 
@@ -193,6 +198,11 @@ function App() {
           ? sourceData
           : sourceData?.sources ?? [],
       );
+      setInvalidSources(
+        Array.isArray(sourceData?.invalid_sources)
+          ? sourceData.invalid_sources
+          : [],
+      );
 
       await loadRuns();
     } catch (err) {
@@ -222,14 +232,71 @@ function App() {
     setForm((current) => ({ ...current, [name]: value }));
   }
 
+  function updateDatasetAssignment(index, field, value) {
+    setForm((current) => ({
+      ...current,
+      datasets: current.datasets.map((dataset, i) =>
+        i === index ? { ...dataset, [field]: value } : dataset
+      ),
+    }));
+  }
+
+  function addDatasetAssignment() {
+    const assigned = new Set(
+      form.datasets.map((dataset) => dataset.source_name)
+    );
+
+    const nextSource = sources.find(
+      (source) => !assigned.has(source.name)
+    );
+
+    if (!nextSource) {
+      setFormError("No hay más datasets disponibles para asignar.");
+      return;
+    }
+
+    setFormError("");
+
+    setForm((current) => ({
+      ...current,
+      datasets: [
+        ...current.datasets,
+        {
+          source_name: nextSource.name,
+          role: current.datasets.some(
+            (dataset) => dataset.role === "train_source"
+          )
+            ? "final_test"
+            : "train_source",
+        },
+      ],
+    }));
+  }
+
+  function removeDatasetAssignment(index) {
+    setForm((current) => ({
+      ...current,
+      datasets: current.datasets.filter((_, i) => i !== index),
+    }));
+  }
+
   function openForm() {
     setFormError("");
     setSuccess("");
+
     setForm({
       ...INITIAL_FORM,
       model_name: models[0]?.name ?? "",
-      source_name: sources[0]?.name ?? "",
+      datasets: sources[0]
+        ? [
+            {
+              source_name: sources[0].name,
+              role: "train_source",
+            },
+          ]
+        : [],
     });
+
     setShowForm(true);
   }
 
@@ -238,62 +305,121 @@ function App() {
     setFormError("");
     setSuccess("");
 
-    if (!form.name.trim()) {
-      setFormError("Ingresá un nombre para el experimento.");
-      return;
-    }
+  if (!form.name.trim()) {
+    setFormError("Ingresá un nombre para el experimento.");
+    return;
+  }
 
-    if (!form.model_name) {
-      setFormError("Seleccioná un modelo.");
-      return;
-    }
+  if (!form.model_name) {
+    setFormError("Seleccioná un modelo.");
+    return;
+  }
 
-    if (!form.source_name) {
-      setFormError("Seleccioná una fuente de datos.");
-      return;
-    }
+  if (form.datasets.length === 0) {
+    setFormError("Asigná al menos un dataset.");
+    return;
+  }
 
-    // Esta primera versión admite una única fuente por experimento.
-    // La API exige que exista al menos una fuente de entrenamiento.
-    if (form.role !== "train_source") {
+  if (!form.datasets.some((dataset) => dataset.role === "train_source")) {
+    setFormError("Debe existir al menos un dataset de entrenamiento.");
+    return;
+  }
+
+  // Evitar que una misma fuente se asigne más de una vez.
+  const assignedNames = form.datasets.map(
+    (dataset) => dataset.source_name
+  );
+
+  if (new Set(assignedNames).size !== assignedNames.length) {
+    setFormError("No podés asignar la misma fuente más de una vez.");
+    return;
+  }
+
+  // Validar porcentajes.
+  const trainPercent = Number(form.train_percent);
+  const validationPercent = Number(form.validation_percent);
+  const testPercent = Number(form.test_percent);
+
+  const percentages = [
+    trainPercent,
+    validationPercent,
+    testPercent,
+  ];
+
+  if (
+    percentages.some(
+      (value) => !Number.isFinite(value) || value <= 0 || value > 100
+    )
+  ) {
+    setFormError("Cada porcentaje debe ser mayor que 0 y no superar 100.");
+    return;
+  }
+
+  const percentageTotal = percentages.reduce(
+    (total, value) => total + value,
+    0
+  );
+
+  if (Math.abs(percentageTotal - 100) > 0.0001) {
+    setFormError("Los porcentajes de entrenamiento, validación y test deben sumar 100%.");
+    return;
+  }
+
+  // Resolver las fuentes y sus rutas.
+  const datasetsPayload = [];
+
+  for (const assignment of form.datasets) {
+    const selectedSource = sources.find(
+      (source) => source.name === assignment.source_name
+    );
+
+    if (!selectedSource?.path) {
       setFormError(
-        "En esta versión, la fuente debe tener el rol Entrenamiento.",
+        `La fuente ${assignment.source_name} no tiene una ruta válida.`
       );
       return;
     }
 
-    const selectedSource = sources.find(
-      (source) => source.name === form.source_name,
-    );
+    datasetsPayload.push({
+      source_name: selectedSource.name,
+      path: selectedSource.path,
+      role: assignment.role,
+    });
+  }
 
-    if (!selectedSource?.path) {
-      setFormError("La fuente seleccionada no tiene una ruta válida.");
-      return;
-    }
+  const trainingAssignment = form.datasets.find(
+    (dataset) => dataset.role === "train_source"
+  );
+  const trainingSource = sources.find(
+    (source) => source.name === trainingAssignment?.source_name
+  );
 
-    const payload = {
-      name: form.name.trim(),
-      description: form.description.trim(),
-      model_name: form.model_name,
-      datasets: [
-        {
-          source_name: selectedSource.name,
-          path: selectedSource.path,
-          role: form.role,
-        },
-      ],
-      parameters: {
-        device: form.device,
-        image_size: Number(form.image_size),
-        batch_size: Number(form.batch_size),
-        epochs: Number(form.epochs),
-        learning_rate: Number(form.learning_rate),
-        weight_decay: Number(form.weight_decay),
-        patience: Number(form.patience),
-        seed: Number(form.seed),
-        freeze_backbone: form.freeze_backbone,
-      },
-    };
+  if (!trainingSource) {
+    setFormError("No se pudo resolver el vocabulario del dataset de entrenamiento.");
+    return;
+  }
+
+const payload = {
+  name: form.name.trim(),
+  description: form.description.trim(),
+  model_name: form.model_name,
+  class_file: trainingSource.class_file ?? null,
+  datasets: datasetsPayload,
+  parameters: {
+    device: form.device,
+    image_size: Number(form.image_size),
+    batch_size: Number(form.batch_size),
+    epochs: Number(form.epochs),
+    learning_rate: Number(form.learning_rate),
+    weight_decay: Number(form.weight_decay),
+    patience: Number(form.patience),
+    seed: Number(form.seed),
+    freeze_backbone: form.freeze_backbone,
+    train_size: trainPercent / 100,
+    val_size: validationPercent / 100,
+    test_size: testPercent / 100,
+  },
+};
 
     setSaving(true);
 
@@ -312,11 +438,20 @@ function App() {
 
       setSuccess(`Experimento creado: ${created.experiment_id}`);
       setShowForm(false);
+
       setForm({
         ...INITIAL_FORM,
         model_name: models[0]?.name ?? "",
-        source_name: sources[0]?.name ?? "",
-      });
+        datasets: sources[0]
+          ? [
+          {
+            source_name: sources[0].name,
+            role: "train_source",
+          },
+        ]
+      : [],
+    });
+
     } catch (err) {
       setFormError(err.message);
     } finally {
@@ -664,38 +799,163 @@ function App() {
                   </select>
                 </label>
 
-                <label>
-                  Fuente de datos *
-                  <select
-                    name="source_name"
-                    value={form.source_name}
-                    onChange={updateForm}
-                    required
-                  >
-                    <option value="">Seleccionar fuente</option>
-                    {sources.map((source) => (
-                      <option key={source.name} value={source.name}>
-                        {source.name} — {source.description}
-                      </option>
-                    ))}
-                  </select>
-                </label>
+                <div className="form-full">
+                  <h3>Datasets</h3>
+                  <p>
+                    Seleccioná las fuentes que participarán en el experimento
+                    y asignales un propósito.
+                  </p>
 
-                <label>
-                  Rol de la fuente *
-                  <select
-                    name="role"
-                    value={form.role}
-                    onChange={updateForm}
-                    required
+                  {form.datasets.map((dataset, index) => (
+                    <div
+                      className="form-grid"
+                      key={`${dataset.source_name}-${index}`}
+                    >
+                      <label>
+                        Dataset *
+                        <select
+                          value={dataset.source_name}
+                          onChange={(event) =>
+                            updateDatasetAssignment(
+                              index,
+                              "source_name",
+                              event.target.value
+                            )
+                          }
+                          required
+                        >
+                          {sources.map((source) => (
+                            <option
+                              key={source.name}
+                              value={source.name}
+                              disabled={form.datasets.some(
+                                (item, i) =>
+                                  i !== index &&
+                                  item.source_name === source.name
+                              )}
+                            >
+                              {source.name} — {source.num_classes} clases · {source.num_images} imágenes
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+
+                      <label>
+                        Rol del dataset *
+                        <select
+                          value={dataset.role}
+                          onChange={(event) =>
+                            updateDatasetAssignment(
+                              index,
+                              "role",
+                              event.target.value
+                            )
+                          }
+                          required
+                        >
+                          {DATASET_ROLES.map((role) => (
+                            <option key={role.value} value={role.value}>
+                              {role.label}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+
+                      <div className="form-full">
+                        <button
+                          type="button"
+                          className="secondary-button"
+                          onClick={() => removeDatasetAssignment(index)}
+                        >
+                          Quitar dataset
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={addDatasetAssignment}
+                    disabled={form.datasets.length >= sources.length}
                   >
-                    {DATASET_ROLES.map((role) => (
-                      <option key={role.value} value={role.value}>
-                        {role.label}
-                      </option>
-                    ))}
-                  </select>
-                </label>
+                    + Agregar dataset
+                  </button>
+
+                  <p className="form-note">
+                    Debe existir al menos un dataset asignado a Entrenamiento.
+                    Cada fuente puede asignarse una sola vez.
+                  </p>
+                </div>
+
+                                <div className="form-full">
+                  <h3>Distribución del dataset de entrenamiento</h3>
+
+                  <p>
+                    Definí cómo se dividirán los datos de las fuentes
+                    asignadas al entrenamiento.
+                  </p>
+
+                  <div className="form-grid">
+                    <label>
+                      Entrenamiento (%)
+                      <input
+                        type="number"
+                        name="train_percent"
+                        min="1"
+                        max="100"
+                        step="any"
+                        value={form.train_percent}
+                        onChange={updateForm}
+                        required
+                      />
+                    </label>
+
+                    <label>
+                      Validación (%)
+                      <input
+                        type="number"
+                        name="validation_percent"
+                        min="1"
+                        max="100"
+                        step="any"
+                        value={form.validation_percent}
+                        onChange={updateForm}
+                        required
+                      />
+                    </label>
+
+                    <label>
+                      Test (%)
+                      <input
+                        type="number"
+                        name="test_percent"
+                        min="1"
+                        max="100"
+                        step="any"
+                        value={form.test_percent}
+                        onChange={updateForm}
+                        required
+                      />
+                    </label>
+                  </div>
+
+                  <p className="form-note">
+                    Total:{" "}
+                    {(
+                      Number(form.train_percent || 0) +
+                      Number(form.validation_percent || 0) +
+                      Number(form.test_percent || 0)
+                    ).toFixed(2)}
+                    % — Los porcentajes deben sumar exactamente 100%.
+                  </p>
+
+                  <p className="form-note">
+                    La validación y el test interno se generan a partir de
+                    las fuentes asignadas a entrenamiento. Una fuente con
+                    rol Prueba final se conserva como conjunto independiente.
+                  </p>
+                </div>
 
                 <label>
                   Dispositivo de ejecución *
@@ -1140,180 +1400,246 @@ function App() {
         )}
 
         {selectedEvaluation && (() => {
-          const result = selectedEvaluation.results;
+            const result = selectedEvaluation.results;
 
-          // La API devuelve las evaluaciones agrupadas por fuente.
-          const tests = result?.tests ?? {};
+            // Evaluaciones agrupadas por fuente de datos.
+            const tests = result?.tests ?? {};
+            const testKeys = Object.keys(tests);
 
-          // Priorizar la fuente original; utilizar otra disponible
-          // como alternativa.
-          const test =
-            tests.original ??
-            Object.values(tests)[0] ??
-            null;
+            // Usar la fuente seleccionada si existe.
+            // Si no existe, seleccionar la primera disponible.
+            const activeTestKey = tests[selectedTestKey]
+                ? selectedTestKey
+                : testKeys[0];
 
-          const metrics = test?.metrics ?? {};
+            const test = activeTestKey ? tests[activeTestKey] : null;
+            const metrics = test?.metrics ?? {};
+            const matrix = test?.confusion_matrix ?? [];
+            const classNames = Object.keys(test?.per_class ?? {});
 
-          const matrix = test?.confusion_matrix ?? [];
-          const classNames = Object.keys(test?.per_class ?? {});
-          const resources = [
-            ["Modelo", result?.model ?? "—"],
-            ["Arquitectura", result?.architecture ?? "—"],
-            ["Dispositivo solicitado", result?.requested_device ?? "—"],
-            ["Dispositivo utilizado", result?.device ?? "—"],
-            ["Checkpoint", result?.checkpoint_path ?? "—"],
-            ["Partición evaluada", test?.partition ?? "—"],
-            ["Muestras evaluadas", test?.num_samples ?? "—"],
-          ];
+            const resources = [
+                ["Fuente evaluada", activeTestKey ?? "—"],
+                ["Modelo", result?.model ?? "—"],
+                ["Arquitectura", result?.architecture ?? "—"],
+                ["Dispositivo solicitado", result?.requested_device ?? "—"],
+                ["Dispositivo utilizado", result?.device ?? "—"],
+                ["Checkpoint", result?.checkpoint_path ?? "—"],
+                ["Partición evaluada", test?.partition ?? "—"],
+                ["Muestras evaluadas", test?.num_samples ?? "—"],
+            ];
 
-          const formatMetric = (value) => {
-            if (value == null || !Number.isFinite(Number(value))) {
-              return "—";
-            }
+            const formatMetric = (value) => {
+                if (value == null || !Number.isFinite(Number(value))) {
+                    return "—";
+                }
 
-            const number = Number(value);
-            return `${(number * 100).toFixed(2)}%`;
-          };
+                return `${(Number(value) * 100).toFixed(2)}%`;
+            };
 
-          const metricCards = [
-            {
-              label: "Accuracy",
-              value: metrics.accuracy,
-            },
-            {
-              label: "F1 macro",
-              value: metrics.f1_macro ?? metrics.macro_f1,
-            },
-            {
-              label: "Precisión macro",
-              value: metrics.precision_macro,
-            },
-            {
-              label: "Recall macro",
-              value: metrics.recall_macro,
-            },
-          ];
+            const metricCards = [
+                {
+                    label: "Accuracy",
+                    value: metrics.accuracy,
+                },
+                {
+                    label: "F1 macro",
+                    value: metrics.f1_macro ?? metrics.macro_f1,
+                },
+                {
+                    label: "Precisión macro",
+                    value: metrics.precision_macro,
+                },
+                {
+                    label: "Recall macro",
+                    value: metrics.recall_macro,
+                },
+            ];
 
-          return (
-            <section
-              className="content-panel"
-              id="evaluation-results"
-            >
-              <div className="panel-heading">
-                <div>
-                  <h2>Resultados de evaluación</h2>
-                  <p>
-                    Ejecución: {selectedEvaluation.runId}
-                  </p>
-                </div>
-
-                <button
-                  type="button"
-                  className="secondary-button"
-                  onClick={() => setSelectedEvaluation(null)}
+            return (
+                <section
+                    className="content-panel"
+                    id="evaluation-results"
                 >
-                  Cerrar
-                </button>
-              </div>
+                    <div className="panel-heading">
+                        <div>
+                            <h2>Resultados de evaluación</h2>
+                            <p>
+                                Ejecución: {selectedEvaluation.runId}
+                            </p>
+                        </div>
 
-              <div className="evaluation-grid">
-                {metricCards.map((metric) => (
-                  <article
-                    className="stat-card"
-                    key={metric.label}
-                  >
-                    <span className="stat-label">
-                      {metric.label}
-                    </span>
-                    <strong>
-                      {formatMetric(metric.value)}
-                    </strong>
-                  </article>
-                ))}
-              </div>
-
-              <div className="evaluation-details">
-                <h3>Métricas adicionales</h3>
-
-                <p>
-                  <strong>Loss:</strong>{" "}
-                  {Number.isFinite(Number(metrics.loss))
-                    ? Number(metrics.loss).toFixed(5)
-                    : "—"}
-                </p>
-
-                <p>
-                  <strong>Clases:</strong>{" "}
-                  {result?.num_classes ?? "—"}
-                </p>
-
-                <p>
-                  <strong>Dispositivo:</strong>{" "}
-                  {result?.device ?? "—"}
-                </p>
-
-                <h3>Matriz de confusión</h3>
-                <p className="resource-detail">
-                  Filas: clase real · Columnas: clase predicha.
-                </p>
-
-                {Array.isArray(matrix) && matrix.length > 0 ? (
-                  <div className="confusion-wrapper">
-                    <table className="confusion-matrix">
-                      <thead>
-                        <tr>
-                          <th className="matrix-axis-label">Real ↓ / Pred. →</th>
-                          {matrix.map((_, index) => (
-                            <th key={index} title={`Clase predicha: ${classNames[index] ?? index}`}>
-                              {classNames[index] ?? index}
-                            </th>
-                          ))}
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {matrix.map((row, rowIndex) => (
-                          <tr key={rowIndex}>
-                            <th scope="row" title={`Clase real: ${classNames[rowIndex] ?? rowIndex}`}>
-                              {classNames[rowIndex] ?? rowIndex}
-                            </th>
-                            {row.map((value, colIndex) => (
-                              <td
-                                key={colIndex}
-                                className={
-                                  rowIndex === colIndex
-                                    ? "matrix-diagonal"
-                                    : value > 0
-                                      ? "matrix-error"
-                                      : ""
-                                }
-                                title={`Real: ${classNames[rowIndex] ?? rowIndex}; predicha: ${classNames[colIndex] ?? colIndex}; cantidad: ${value}`}
-                              >
-                                {value}
-                              </td>
-                            ))}
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                ) : (
-                  <p className="resource-detail">
-                    La API no devolvió una matriz de confusión en el formato esperado.
-                  </p>
-                )}
-
-                <h3>Configuración y recursos utilizados</h3>
-                <div className="evaluation-resources">
-                  {resources.map(([label, value]) => (
-                    <div className="evaluation-resource" key={label}>
-                      <span>{label}</span>
-                      <strong>{String(value)}</strong>
+                        <button
+                            type="button"
+                            className="secondary-button"
+                            onClick={() => {
+                                setSelectedEvaluation(null);
+                                setSelectedTestKey("original");
+                            }}
+                        >
+                            Cerrar
+                        </button>
                     </div>
-                  ))}
-                </div>
-              </div>
-            </section>
-          );
+
+                    {testKeys.length > 0 ? (
+                        <>
+                            <div className="evaluation-details">
+                                <label htmlFor="evaluation-source">
+                                    <strong>Conjunto evaluado</strong>
+                                </label>
+
+                                <select
+                                    id="evaluation-source"
+                                    value={activeTestKey ?? ""}
+                                    onChange={(event) =>
+                                        setSelectedTestKey(event.target.value)
+                                    }
+                                >
+                                    {testKeys.map((key) => (
+                                        <option key={key} value={key}>
+                                            {key}
+                                        </option>
+                                    ))}
+                                </select>
+
+                                <p className="resource-detail">
+                                    Partición: {test?.partition ?? "—"} ·
+                                    {" "}Muestras: {test?.num_samples ?? "—"}
+                                </p>
+                            </div>
+
+                            <div className="evaluation-grid">
+                                {metricCards.map((metric) => (
+                                    <article
+                                        className="stat-card"
+                                        key={metric.label}
+                                    >
+                                        <span className="stat-label">
+                                            {metric.label}
+                                        </span>
+
+                                        <strong>
+                                            {formatMetric(metric.value)}
+                                        </strong>
+                                    </article>
+                                ))}
+                            </div>
+
+                            <div className="evaluation-details">
+                                <h3>Métricas adicionales</h3>
+
+                                <p>
+                                    <strong>Loss:</strong>{" "}
+                                    {Number.isFinite(Number(metrics.loss)) &&
+                                    metrics.loss != null
+                                        ? Number(metrics.loss).toFixed(5)
+                                        : "—"}
+                                </p>
+
+                                <p>
+                                    <strong>Clases:</strong>{" "}
+                                    {result?.num_classes ?? classNames.length ?? "—"}
+                                </p>
+
+                                <p>
+                                    <strong>Dispositivo:</strong>{" "}
+                                    {result?.device ?? "—"}
+                                </p>
+
+                                <h3>Matriz de confusión</h3>
+
+                                <p className="resource-detail">
+                                    Filas: clase real · Columnas: clase predicha.
+                                </p>
+
+                                {Array.isArray(matrix) && matrix.length > 0 ? (
+                                    <div className="confusion-wrapper">
+                                        <table className="confusion-matrix">
+                                            <thead>
+                                                <tr>
+                                                    <th className="matrix-axis-label">
+                                                        Real ↓ / Pred. →
+                                                    </th>
+
+                                                    {matrix.map((_, index) => (
+                                                        <th
+                                                            key={index}
+                                                            title={`Clase predicha: ${
+                                                                classNames[index] ?? index
+                                                            }`}
+                                                        >
+                                                            {classNames[index] ?? index}
+                                                        </th>
+                                                    ))}
+                                                </tr>
+                                            </thead>
+
+                                            <tbody>
+                                                {matrix.map((row, rowIndex) => (
+                                                    <tr key={rowIndex}>
+                                                        <th
+                                                            scope="row"
+                                                            title={`Clase real: ${
+                                                                classNames[rowIndex] ?? rowIndex
+                                                            }`}
+                                                        >
+                                                            {classNames[rowIndex] ?? rowIndex}
+                                                        </th>
+
+                                                        {row.map((value, colIndex) => (
+                                                            <td
+                                                                key={colIndex}
+                                                                className={
+                                                                    rowIndex === colIndex
+                                                                        ? "matrix-diagonal"
+                                                                        : value > 0
+                                                                          ? "matrix-error"
+                                                                          : ""
+                                                                }
+                                                                title={`Real: ${
+                                                                    classNames[rowIndex] ?? rowIndex
+                                                                }; predicha: ${
+                                                                    classNames[colIndex] ?? colIndex
+                                                                }; cantidad: ${value}`}
+                                                            >
+                                                                {value}
+                                                            </td>
+                                                        ))}
+                                                    </tr>
+                                                ))}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                ) : (
+                                    <p className="resource-detail">
+                                        La API no devolvió una matriz de confusión
+                                        en el formato esperado para esta fuente.
+                                    </p>
+                                )}
+
+                                <h3>Configuración y recursos utilizados</h3>
+
+                                <div className="evaluation-resources">
+                                    {resources.map(([label, value]) => (
+                                        <div
+                                            className="evaluation-resource"
+                                            key={label}
+                                        >
+                                            <span>{label}</span>
+                                            <strong>{String(value)}</strong>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        </>
+                    ) : (
+                        <p className="resource-detail">
+                            La API no devolvió evaluaciones agrupadas por fuente
+                            en result.tests. Revisá la estructura de la respuesta
+                            del endpoint /results.
+                        </p>
+                    )}
+                </section>
+            );
         })()}
 
 
@@ -1321,7 +1647,7 @@ function App() {
           <div className="panel-heading">
             <div>
               <h2>Recursos disponibles</h2>
-              <p>Modelos y fuentes de datos expuestos por la API.</p>
+              <p>Modelos y datasets detectados por el backend al iniciar.</p>
             </div>
           </div>
 
@@ -1329,7 +1655,6 @@ function App() {
             <div className="resource-card">
               <span>MODELOS</span>
               <strong>{models.length}</strong>
-
               {models.length > 0 ? (
                 models.map((model) => (
                   <p key={model.name}>
@@ -1343,22 +1668,41 @@ function App() {
             </div>
 
             <div className="resource-card">
-              <span>FUENTES DE DATOS</span>
+              <span>DATASETS VÁLIDOS</span>
               <strong>{sources.length}</strong>
-
               {sources.length > 0 ? (
                 sources.map((source) => (
                   <p key={source.name}>
-                    {source.name}
+                    <strong>{source.name}</strong>
+                    <span className="resource-detail">
+                      {source.num_classes} clases · {source.num_images} imágenes
+                    </span>
                     <span className="resource-detail">
                       {source.description}
+                    </span>
+                    <span className="resource-detail">
+                      Clases: {(source.classes ?? []).join(", ")}
                     </span>
                   </p>
                 ))
               ) : (
-                <p>No se encontraron fuentes.</p>
+                <p>No se detectaron datasets válidos.</p>
               )}
             </div>
+
+            {invalidSources.length > 0 && (
+              <div className="resource-card resource-card-warning">
+                <span>CARPETAS RECHAZADAS</span>
+                <strong>{invalidSources.length}</strong>
+                {invalidSources.map((source) => (
+                  <p key={`${source.name}-${source.path}`}>
+                    <strong>{source.name}</strong>
+                    <span className="resource-detail">{source.path}</span>
+                    <span className="resource-detail">{source.reason}</span>
+                  </p>
+                ))}
+              </div>
+            )}
           </div>
         </section>
 

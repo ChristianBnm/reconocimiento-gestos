@@ -1,22 +1,21 @@
 from fastapi import APIRouter
+
+from src.api.dependencies import PROJECT_ROOT
 from src.core.configuracion.catalogo import cargar_catalogos
+from src.core.configuracion.discovery import get_dataset_catalog
 
 router = APIRouter(tags=["Datos"])
 
 
 @router.get("/api/sources")
 def get_sources() -> dict:
-    sources, scenarios = cargar_catalogos()
+    """Devuelve los datasets válidos detectados y los rechazados con su motivo."""
+    _, scenarios = cargar_catalogos()
+    catalog = get_dataset_catalog(PROJECT_ROOT)
 
     return {
-        "sources": [
-            {
-                "name": name,
-                "description": spec.get("description", ""),
-                "path": spec["path"],
-            }
-            for name, spec in sources.items()
-        ],
+        "sources": catalog["sources"],
+        "invalid_sources": catalog["invalid_sources"],
         "scenarios": [
             {
                 "name": name,

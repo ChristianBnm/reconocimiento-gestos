@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import time
+import platform
 from pathlib import Path
 
 import torch
@@ -12,11 +13,13 @@ from torch.utils.data import DataLoader
 
 from src.core.experimentos.evaluation import (
     _configuracion_del_checkpoint,
+    _guardar_json_atomico,
 )
 from src.core.experimentos.service import ExperimentService
 from src.core.dataset.experiment import ProjectPaths, prepare_sources, subset_for
 from src.core.dataset.transforms import build_eval_transform
 from src.core.modelos.factory import crear_modelo
+from src.core.dataset.split import dataset_fingerprint
 
 
 def benchmark_ejecucion(
@@ -26,6 +29,12 @@ def benchmark_ejecucion(
     warmup_batches: int = 5,
 ) -> dict:
     root = Path(root).expanduser().resolve()
+
+    if (isinstance(warmup_batches, bool) or not isinstance(warmup_batches, int) or warmup_batches < 0):
+        raise ValueError(
+            "warmup_batches debe ser un entero mayor o igual a cero."
+        )
+
     service = ExperimentService(root)
     run = service.get_run(run_id)
 
@@ -37,15 +46,34 @@ def benchmark_ejecucion(
         checkpoint_path = root / checkpoint_path
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     checkpoint = torch.load(
-        checkpoint_path, map_location=device, weights_only=False
+        checkpoint_path,
+        map_location=device,
+        weights_only=True,
     )
+
     spec = service.get_experiment(run.experiment_id)
 
-    if (checkpoint.get("metadata") or {}).get("run_id") != run.run_id:
+    metadata = checkpoint.get("metadata")
+
+    if not isinstance(metadata, dict):
+        raise ValueError("El checkpoint no contiene metadata válida.")
+
+    if metadata.get("run_id") != run.run_id:
         raise ValueError("El checkpoint no corresponde a esta ejecución.")
 
-    config = _configuracion_del_checkpoint(checkpoint, spec)
+    expected_fingerprints = metadata.get("fingerprints")
+
+    if not isinstance(expected_fingerprints, dict):
+        raise ValueError("El checkpoint no contiene fingerprints de los datasets.")
+
+    config = _configuracion_del_checkpoint(
+        checkpoint,
+        spec,
+        service,
+    )
+
     source_assignments = [
         d for d in spec.datasets if d.role == "train_source"
     ]
@@ -59,7 +87,31 @@ def benchmark_ejecucion(
         path_overrides=path_overrides,
         create_missing_splits=False,
         regenerate_splits=False,
+        source_assignments=source_assignments,
     )
+
+    if len(source_names) != 1:
+        raise ValueError(
+            "Este benchmark requiere una única fuente de test."
+        )
+
+    source_name = source_names[0]
+
+    if source_name not in expected_fingerprints:
+        raise ValueError(
+            f"El checkpoint no contiene el fingerprint de '{source_name}'."
+        )
+
+    actual_fingerprint = dataset_fingerprint(
+        prepared[source_name].dataset
+    )
+
+    if actual_fingerprint != expected_fingerprints[source_name]:
+        raise ValueError(
+            "El fingerprint del dataset actual no coincide con "
+            "el utilizado durante el entrenamiento. "
+            "El benchmark fue cancelado por integridad de datos."
+        )
 
     datasets = [
         subset_for(
@@ -68,10 +120,6 @@ def benchmark_ejecucion(
         )
         for name in source_names
     ]
-    if len(datasets) != 1:
-        raise ValueError(
-            "Este benchmark requiere una única fuente de test."
-        )
 
     loader = DataLoader(
         datasets[0],
@@ -133,6 +181,26 @@ def benchmark_ejecucion(
     sincronizar()
     end_to_end_seconds = time.perf_counter() - start
 
+    if samples == 0:
+        raise ValueError(
+            "No hay muestras disponibles en la partición test para realizar el benchmark."
+        )
+
+    if model_seconds <= 0:
+        raise ValueError(
+            "El tiempo de inferencia medido debe ser mayor que cero."
+        )
+
+    if end_to_end_samples == 0:
+        raise ValueError(
+            "No hay muestras disponibles para medir el tiempo extremo a extremo."
+        )
+
+    if end_to_end_seconds <= 0:
+        raise ValueError(
+            "El tiempo extremo a extremo debe ser mayor que cero."
+        )
+
     result = {
         "run_id": run.run_id,
         "experiment_id": run.experiment_id,
@@ -151,17 +219,39 @@ def benchmark_ejecucion(
             end_to_end_seconds * 1000 / end_to_end_samples
         ),
         "batches_measured": batches,
+
+        "environment": {
+            "training": {
+                "device": metadata.get("device"),
+                "gpu_name": metadata.get("gpu_name"),
+                "python_version": metadata.get("python_version"),
+                "torch_version": metadata.get("torch_version"),
+                "cuda_version": metadata.get("cuda_version"),
+            },
+            "benchmark": {
+                "device": str(device),
+                "gpu_name": (
+                    torch.cuda.get_device_name(device)
+                    if device.type == "cuda"
+                    else None
+                ),
+                "python_version": platform.python_version(),
+                "torch_version": str(torch.__version__),
+                "cuda_version": torch.version.cuda,
+            },
+        },
     }
 
     output_path = (
         root / "results" / "experiments"
         / run.experiment_id / run.run_id / "benchmark.json"
     )
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(
-        json.dumps(result, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
+
+    _guardar_json_atomico(
+        output_path,
+        result,
     )
+
     result["benchmark_path"] = str(output_path.relative_to(root))
     return result
 

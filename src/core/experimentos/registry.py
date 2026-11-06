@@ -211,10 +211,17 @@ class ExperimentRegistry:
 
         changes: dict[str, Any] = {"status": status}
 
-        if checkpoint_path is not None:
+        if status == "completed":
             changes["checkpoint_path"] = checkpoint_path
-        if error_message is not None:
+            changes["error_message"] = None
+
+        elif status == "failed":
+            changes["checkpoint_path"] = None
             changes["error_message"] = error_message
+
+        elif status == "cancelled":
+            changes["checkpoint_path"] = None
+            changes["error_message"] = None
 
         if status in TERMINAL_RUN_STATUSES:
             changes["finished_at"] = utc_now()
@@ -240,7 +247,14 @@ class ExperimentRegistry:
 
         runs: list[RunRecord] = []
         for path in sorted(self.runs_dir.glob("*.json")):
+
             run = RunRecord.from_dict(self._read_json(path))
+
+            if run.run_id != path.stem:
+                raise ValueError(
+                    f"El ID del archivo no coincide con la ejecución: {path}"
+            )
+
             if experiment_id is None or run.experiment_id == experiment_id:
                 runs.append(run)
 

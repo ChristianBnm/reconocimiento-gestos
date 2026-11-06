@@ -10,7 +10,6 @@ router = APIRouter(tags=["Experimentos"])
     status_code=status.HTTP_201_CREATED,
 )
 
-
 def create_experiment(payload: dict) -> dict:
     try:
         data = dict(payload)

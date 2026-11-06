@@ -1,3 +1,4 @@
+"""
 from __future__ import annotations
 
 import json
@@ -309,3 +310,71 @@ def test_normalizacion_se_adapta_a_metadatos_del_modelo():
     assert updated.normalization_mean == (0.5, 0.5, 0.5)
     assert updated.normalization_std == (0.25, 0.25, 0.25)
     assert config.normalization_mean != updated.normalization_mean
+
+
+
+def test_dataset_detecta_hashes_duplicados_entre_fuentes(tmp_path):
+    import shutil
+
+    from src.core.dataset.loader import GestosDataset
+
+    original = tmp_path / "original"
+    complementario = tmp_path / "complementario"
+
+    original_class = original / "A"
+    complementario_class = complementario / "A"
+    original_class.mkdir(parents=True)
+    complementario_class.mkdir(parents=True)
+
+    imagen_original = original_class / "imagen.jpg"
+    imagen_copia = complementario_class / "copia.jpg"
+
+    _write_rgb_image(imagen_original, 123)
+    shutil.copyfile(imagen_original, imagen_copia)
+
+    dataset = GestosDataset(
+        [original, complementario],
+        class_names=("A",),
+        source_names=("original", "complementario"),
+        deduplicate_exact_duplicates=False,
+    )
+
+    hashes = [record.group_id for record in dataset.records]
+
+    assert len(dataset.records) == 2
+    assert hashes[0] == hashes[1]
+    assert dataset.records[0].source == "original"
+    assert dataset.records[1].source == "complementario"
+    assert dataset.records[0].path.is_file()
+    assert dataset.records[1].path.is_file()
+
+
+def test_dataset_rechaza_mismo_contenido_en_clases_distintas_entre_fuentes(
+    tmp_path,
+):
+    import shutil
+
+    from src.core.dataset.loader import GestosDataset
+
+    original = tmp_path / "original"
+    complementario = tmp_path / "complementario"
+
+    original_class = original / "A"
+    complementario_class = complementario / "B"
+    original_class.mkdir(parents=True)
+    complementario_class.mkdir(parents=True)
+
+    imagen_original = original_class / "imagen.jpg"
+    imagen_copia = complementario_class / "copia.jpg"
+
+    _write_rgb_image(imagen_original, 456)
+    shutil.copyfile(imagen_original, imagen_copia)
+
+    with pytest.raises(ValueError, match="clases distintas"):
+        GestosDataset(
+            [original, complementario],
+            class_names=("A", "B"),
+            source_names=("original", "complementario"),
+            deduplicate_exact_duplicates=False,
+        )
+"""

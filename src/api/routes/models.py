@@ -10,11 +10,14 @@ router = APIRouter(tags=["Modelos"])
 
 @router.get("/api/models")
 def get_models() -> list[dict[str, str]]:
-    return [
-        {
+    models = []
+
+    for name in list_models():
+        spec = get_model_spec(name)
+        models.append({
             "name": name,
-            "architecture": get_model_spec(name).architecture,
-            "family": get_model_spec(name).family,
-        }
-        for name in list_models()
-    ]
+            "architecture": spec.architecture,
+            "family": spec.family,
+        })
+
+    return models

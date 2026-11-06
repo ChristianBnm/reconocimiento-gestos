@@ -1,13 +1,24 @@
-# API de reconocimiento de gestos LSA.
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from src.api.dependencies import PROJECT_ROOT
 from src.api.routes import evaluation, experiments, health, models, runs, sources
+from src.core.configuracion.discovery import get_dataset_catalog
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Detecta datasets al iniciar. La caché se mantiene hasta reiniciar el backend.
+    get_dataset_catalog(PROJECT_ROOT)
+    yield
+
 
 app = FastAPI(
     title="LSA Gesture Recognition API",
     description="Gestionar experimentos y ejecuciones de reconocimiento de gestos.",
     version="0.2.0",
+    lifespan=lifespan,
 )
 
 app.include_router(health.router)

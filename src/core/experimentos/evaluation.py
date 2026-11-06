@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from dataclasses import replace
+from dataclasses import fields, replace
 from pathlib import Path
 
 import torch
@@ -23,6 +23,7 @@ from src.core.dataset.transforms import build_eval_transform
 from src.core.experimentos.schemas import RunRecord
 from src.core.experimentos.service import ExperimentService
 from src.core.modelos.factory import crear_modelo
+from src.core.dataset.split import dataset_fingerprint
 
 
 def _guardar_json_atomico(path: Path, contenido: dict) -> None:
@@ -59,6 +60,7 @@ def _guardar_json_atomico(path: Path, contenido: dict) -> None:
 def _configuracion_del_checkpoint(
     checkpoint: dict,
     spec,
+    service: ExperimentService,
 ) -> ExperimentConfig:
     """Reconstruye la configuración utilizada durante el entrenamiento."""
     config_guardada = checkpoint.get("experiment_config")
@@ -68,36 +70,17 @@ def _configuracion_del_checkpoint(
             "El checkpoint no contiene experiment_config."
         )
 
-    config = ExperimentService._build_config(spec)
+    config = service._build_config(spec)
 
-    campos = {
-        "image_size",
-        "train_size",
-        "val_size",
-        "test_size",
-        "seed",
-        "split_seed",
-        "batch_size",
-        "learning_rate",
-        "weight_decay",
-        "epochs",
-        "patience",
-        "min_delta",
-        "num_workers",
-        "pin_memory",
-        "freeze_backbone",
-        "horizontal_flip_probability",
-        "affine_probability",
-        "brightness_contrast_probability",
-        "normalization_mean",
-        "normalization_std",
-        "device",
+    campos_config = {
+        item.name
+        for item in fields(ExperimentConfig)
     }
 
     cambios = {
         key: value
         for key, value in config_guardada.items()
-        if key in campos
+        if key in campos_config and key != "model"
     }
 
     for key in ("normalization_mean", "normalization_std"):
@@ -112,17 +95,20 @@ def _validar_checkpoint(
     run: RunRecord,
     config: ExperimentConfig,
 ) -> tuple[tuple[str, ...], int]:
+
     """Valida la identidad del checkpoint y la correspondencia de clases."""
     metadata = checkpoint.get("metadata")
 
     if not isinstance(metadata, dict):
         raise ValueError(
-            "El checkpoint no contiene metadatos válidos."
+            "El checkpoint no contiene metadata válida."
         )
 
-    if metadata.get("experiment_id") != run.experiment_id:
+    expected_fingerprints = metadata.get("fingerprints")
+
+    if not isinstance(expected_fingerprints, dict):
         raise ValueError(
-            "El checkpoint no coincide con el experimento."
+            "El checkpoint no contiene fingerprints de los datasets."
         )
 
     if metadata.get("run_id") != run.run_id:
@@ -255,11 +241,10 @@ def evaluar_ejecucion(
         )
 
     # Se carga el checkpoint una sola vez.
-    # weights_only=False presupone un checkpoint propio y confiable.
     checkpoint = torch.load(
         checkpoint_path,
         map_location="cpu",
-        weights_only=False,
+        weights_only=True,
     )
 
     if not isinstance(checkpoint, dict):
@@ -267,7 +252,25 @@ def evaluar_ejecucion(
             "El contenido del checkpoint no tiene el formato esperado."
         )
 
-    config = _configuracion_del_checkpoint(checkpoint, spec)
+    metadata = checkpoint.get("metadata")
+
+    if not isinstance(metadata, dict):
+        raise ValueError(
+        "El checkpoint no contiene metadata válida."
+        )
+
+    expected_fingerprints = metadata.get("fingerprints")
+
+    if not isinstance(expected_fingerprints, dict):
+        raise ValueError(
+            "El checkpoint no contiene fingerprints de los datasets."
+        )
+
+    config = _configuracion_del_checkpoint(
+        checkpoint,
+        spec,
+        service,
+    )
 
     class_names, num_classes = _validar_checkpoint(
         checkpoint,
@@ -307,13 +310,33 @@ def evaluar_ejecucion(
         path_overrides=path_overrides,
         create_missing_splits=False,
         regenerate_splits=False,
+        source_assignments=source_assignments,
     )
+
+    actual_fingerprints = {
+        name: dataset_fingerprint(prepared[name].dataset)
+        for name in source_names
+    }
+
+    if actual_fingerprints != expected_fingerprints:
+        raise ValueError(
+            "Los fingerprints de los datasets actuales no coinciden "
+            "con los utilizados durante el entrenamiento. "
+            "La evaluación fue cancelada por integridad de datos."
+        )
 
     architecture = checkpoint.get("architecture")
 
     if not architecture:
         raise ValueError(
             "El checkpoint no declara la arquitectura."
+        )
+
+    if architecture != config.model.architecture:
+        raise ValueError(
+            f"La arquitectura del checkpoint ({architecture!r}) "
+            f"no coincide con la del experimento "
+            f"({config.model.architecture!r})."
         )
 
     model = crear_modelo(
