@@ -81,6 +81,7 @@ class ExperimentSpec:
     datasets: tuple[DatasetAssignment, ...]
     parameters: dict[str, Any] = field(default_factory=dict)
     description: str = ""
+    class_file: str | None = None
     experiment_id: str = field(default_factory=lambda: uuid4().hex)
 
     def __post_init__(self) -> None:
@@ -124,6 +125,7 @@ class ExperimentSpec:
             "datasets": [d.to_dict() for d in self.datasets],
             "parameters": deepcopy(self.parameters),
             "description": self.description,
+            "class_file": self.class_file,
         }
 
     @classmethod
@@ -140,6 +142,7 @@ class ExperimentSpec:
             ),
             parameters=data.get("parameters", {}),
             description=data.get("description", ""),
+            class_file=data.get("class_file"),
         )
 
 

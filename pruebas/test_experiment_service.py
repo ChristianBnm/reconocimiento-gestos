@@ -33,20 +33,50 @@ def test_create_and_load_experiment(tmp_path):
     service = ExperimentService(tmp_path)
     spec = make_spec(dataset_path)
 
-    created = service.create_experiment(spec)
-    loaded = service.get_experiment(created.experiment_id)
+    with (
+        patch(
+            "src.core.experimentos.service.get_dataset_catalog",
+            return_value={
+                "sources": [
+                    {
+                        "name": "original",
+                        "path": str(dataset_path),
+                    }
+                ],
+                "invalid_sources": [],
+            },
+        ),
+        patch(
+            "src.core.experimentos.service.inspect_dataset_directory"
+        ),
+    ):
+        created = service.create_experiment(spec)
+        loaded = service.get_experiment(created.experiment_id)
 
     assert loaded.experiment_id == spec.experiment_id
     assert loaded.name == spec.name
     assert loaded.model_name == spec.model_name
     assert service.list_experiments()
 
-
 def test_validate_experiment_rejects_missing_dataset(tmp_path):
     service = ExperimentService(tmp_path)
     spec = make_spec(tmp_path / "dataset_inexistente")
 
-    with pytest.raises(FileNotFoundError):
+    with (
+        patch(
+            "src.core.experimentos.service.get_dataset_catalog",
+            return_value={
+                "sources": [
+                    {
+                        "name": "original",
+                        "path": str(tmp_path / "dataset_inexistente"),
+                    }
+                ],
+                "invalid_sources": [],
+            },
+        ),
+        pytest.raises(FileNotFoundError),
+    ):
         service.validate_experiment(spec)
 
 
@@ -69,7 +99,24 @@ def test_validate_experiment_rejects_unknown_parameter(tmp_path):
 
     service = ExperimentService(tmp_path)
 
-    with pytest.raises(ValueError, match="Parámetros de configuración desconocidos"):
+    with (
+        patch(
+            "src.core.experimentos.service.get_dataset_catalog",
+            return_value={
+                "sources": [
+                    {"name": "original", "path": str(dataset_path)}
+                ],
+                "invalid_sources": [],
+            },
+        ),
+        patch(
+            "src.core.experimentos.service.inspect_dataset_directory"
+        ),
+        pytest.raises(
+            ValueError,
+            match="Parámetros de configuración desconocidos",
+        ),
+    ):
         service.validate_experiment(spec)
 
 
@@ -103,11 +150,18 @@ def test_run_experiment_marks_completed_with_checkpoint(tmp_path):
     assert "fallo de preparación" in runs[0].error_message
 
 
-def test_run_experiment_records_training_error(tmp_path):
+def test_run_experiment_records_training_error(tmp_path, monkeypatch):
     dataset_path = tmp_path / "dataset"
     dataset_path.mkdir()
 
     service = ExperimentService(tmp_path)
+
+    monkeypatch.setattr(
+        ExperimentService,
+        "validate_experiment",
+    lambda self, spec: None,
+    )
+
     spec = service.create_experiment(make_spec(dataset_path))
 
     with (
@@ -140,6 +194,13 @@ def test_run_experiment_marks_completed_with_checkpoint(tmp_path, monkeypatch):
     dataset_path.mkdir()
 
     service = ExperimentService(tmp_path)
+
+    monkeypatch.setattr(
+        ExperimentService,
+        "validate_experiment",
+        lambda self, spec: None,
+    )
+
     spec = service.create_experiment(make_spec(dataset_path))
 
     # Simula una fuente preparada sin cargar imágenes reales.
@@ -214,6 +275,7 @@ def test_run_experiment_marks_completed_with_checkpoint(tmp_path, monkeypatch):
             checkpoint_path,
             history_path,
             metadata=None,
+            cancel_event=None,
         ):
             self.checkpoint_path = checkpoint_path
 
@@ -224,13 +286,17 @@ def test_run_experiment_marks_completed_with_checkpoint(tmp_path, monkeypatch):
             )
             self.checkpoint_path.write_bytes(b"checkpoint de prueba")
 
+
     monkeypatch.setattr(service_module, "Trainer", FakeTrainer)
 
     monkeypatch.setattr(
     service_module,
     "congelar_backbone",
     lambda model: model,
-    )
+        )
+
+    print("VALIDATE:", service.validate_experiment)
+    print("CLASS:", service.validate_experiment.__func__)
 
     run = service.run_experiment(spec.experiment_id)
 
@@ -254,22 +320,25 @@ def test_run_experiment_preserves_original_error_if_failure_recording_fails(
     dataset_path.mkdir()
 
     service = ExperimentService(tmp_path)
-    spec = service.create_experiment(make_spec(dataset_path))
-
-    original_error = RuntimeError("fallo original del entrenamiento")
 
     monkeypatch.setattr(
         service_module.ExperimentService,
         "validate_experiment",
         lambda self, spec: None,
     )
+
+    spec = service.create_experiment(make_spec(dataset_path))
+
+    original_error = RuntimeError("fallo original del entrenamiento")
+
     monkeypatch.setattr(
         service_module,
         "prepare_sources",
         lambda *args, **kwargs: (_ for _ in ()).throw(original_error),
     )
-    
+
     original_update = service.registry.update_run_status
+
     def update_status_with_failure_on_error(
         run_id, status, **kwargs
     ):
@@ -285,3 +354,51 @@ def test_run_experiment_preserves_original_error_if_failure_recording_fails(
 
     with pytest.raises(RuntimeError, match="fallo original del entrenamiento"):
         service.run_experiment(spec.experiment_id)
+
+
+
+def test_validate_experiment_accepts_distinct_dataset_roles(tmp_path):
+    """Las fuentes con roles distintos son válidas si sus rutas existen."""
+    train_path = tmp_path / "train"
+    test_path = tmp_path / "test"
+    train_path.mkdir()
+    test_path.mkdir()
+
+    service = ExperimentService(tmp_path)
+    spec = ExperimentSpec(
+        name="Experimento sin fuga",
+        model_name="mobilenetv2",
+        datasets=(
+            DatasetAssignment(
+                source_name="original",
+                path=str(train_path),
+                role="train_source",
+            ),
+            DatasetAssignment(
+                source_name="complementario",
+                path=str(test_path),
+                role="final_test",
+            ),
+        ),
+        parameters={},
+        description="Prueba de roles",
+    )
+
+    with (
+        patch(
+            "src.core.experimentos.service.get_dataset_catalog",
+            return_value={
+                "sources": [
+                    {"name": "original", "path": str(train_path)},
+                    {"name": "complementario", "path": str(test_path)},
+                ],
+                "invalid_sources": [],
+            },
+        ),
+        patch(
+            "src.core.experimentos.service.inspect_dataset_directory"
+        ) as mock_inspect,
+    ):
+        service.validate_experiment(spec)
+
+    assert mock_inspect.call_count == 2

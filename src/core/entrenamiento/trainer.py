@@ -39,6 +39,51 @@ class Trainer:
             self.device = next(model.parameters()).device
         except StopIteration as exc:
             raise ValueError("El modelo no tiene parámetros.") from exc
+
+        classifier = (
+            model.get_classifier()
+            if hasattr(model, "get_classifier")
+            else None
+        )
+
+        if config.freeze_backbone:
+            if classifier is None:
+                raise ValueError(
+                    "El modelo no expone un clasificador para validar "
+                    "el congelamiento del backbone."
+                )
+
+            classifier_parameter_ids = {
+                id(parameter)
+                for parameter in classifier.parameters()
+            }
+
+            if not classifier_parameter_ids:
+                raise ValueError(
+                    "El clasificador no tiene parámetros."
+                )
+
+            for name, parameter in model.named_parameters():
+                if id(parameter) in classifier_parameter_ids:
+                    if not parameter.requires_grad:
+                        raise ValueError(
+                            f"El parámetro del clasificador '{name}' "
+                            "debería estar entrenable."
+                        )
+                elif parameter.requires_grad:
+                    raise ValueError(
+                        f"El parámetro del backbone '{name}' "
+                        "debería estar congelado."
+                    )
+
+        elif not all(
+            parameter.requires_grad
+            for parameter in model.parameters()
+        ):
+            raise ValueError(
+                "freeze_backbone=False, pero existen parámetros congelados."
+            )
+
         self.criterion = torch.nn.CrossEntropyLoss()
         trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
         if not trainable_parameters:
@@ -180,6 +225,7 @@ def entrenar(
         pretrained=config.model.pretrained,
     )
     model = congelar_backbone(model) if config.freeze_backbone else descongelar_modelo(model)
+
     trainer = Trainer(
         model=model,
         train_loader=train_loader,

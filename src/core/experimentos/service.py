@@ -25,9 +25,12 @@ from src.core.configuracion.settings import (
     get_model_spec,
 )
 from src.core.dataset.experiment import (
-    SOURCE_NAMES,
     prepare_sources,
     subset_for,
+)
+from src.core.configuracion.discovery import (
+    get_dataset_catalog,
+    inspect_dataset_directory,
 )
 from src.core.dataset.split import dataset_fingerprint
 from src.core.dataset.transforms import (
@@ -139,18 +142,39 @@ class ExperimentService:
 
         get_model_spec(spec.model_name)
 
+        catalog = get_dataset_catalog(self.paths.root)
+        available_sources = {
+            source["name"]: source for source in catalog["sources"]
+        }
+        invalid_catalog_sources = {
+            source["name"]: source for source in catalog["invalid_sources"]
+        }
+
         unknown_sources = sorted(
             {
                 dataset.source_name
                 for dataset in spec.datasets
-                if dataset.source_name not in SOURCE_NAMES
+                if dataset.source_name not in available_sources
+                and dataset.source_name not in invalid_catalog_sources
             }
         )
         if unknown_sources:
             raise ValueError(
-                "Fuentes no definidas en el catálogo del proyecto: "
+                "Fuentes no detectadas en data/ o no configuradas: "
                 + ", ".join(unknown_sources)
             )
+
+        rejected_sources = sorted(
+            name for name in {
+                dataset.source_name for dataset in spec.datasets
+            } if name in invalid_catalog_sources
+        )
+        if rejected_sources:
+            details = "; ".join(
+                f"{name}: {invalid_catalog_sources[name]['reason']}"
+                for name in rejected_sources
+            )
+            raise ValueError("Hay fuentes con estructura no válida: " + details)
 
         invalid_roles = sorted(
             {
@@ -164,7 +188,7 @@ class ExperimentService:
                 "Roles de dataset no válidos: " + ", ".join(invalid_roles)
             )
 
-        self._build_config(spec)
+        config = self._build_config(spec)
 
         for dataset in spec.datasets:
             if dataset.role == "unused":
@@ -172,19 +196,14 @@ class ExperimentService:
             path = Path(dataset.path).expanduser()
             if not path.is_absolute():
                 path = self.paths.root / path
-            if not path.is_dir():
-                raise FileNotFoundError(
-                    f"No existe el directorio de la fuente "
-                    f"'{dataset.source_name}': {path}"
-                )
+            inspect_dataset_directory(path, expected_class_names=config.class_names)
 
-    @staticmethod
-    def _build_config(spec: ExperimentSpec) -> ExperimentConfig:
-        """Convierte parámetros de la definición a la configuración existente."""
+    def _build_config(self, spec: ExperimentSpec) -> ExperimentConfig:
         allowed = {
             item.name
             for item in fields(ExperimentConfig)
         }
+
         forbidden = {"model", "class_names"} & set(spec.parameters)
         if forbidden:
             raise ValueError(
@@ -201,9 +220,49 @@ class ExperimentService:
 
         return build_experiment_config(
             spec.model_name,
-            class_names=cargar_clases(),
+            class_names=self._resolve_class_names(spec),
             **spec.parameters,
         )
+
+    def _resolve_class_names(
+        self,
+        spec: ExperimentSpec,
+    ) -> tuple[str, ...]:
+        if spec.class_file is None:
+            return cargar_clases()
+
+        path = Path(spec.class_file).expanduser()
+
+        if not path.is_absolute():
+            path = self.paths.root / path
+
+        return cargar_clases(path)
+
+
+    @staticmethod
+    def _resolve_device(device_config: str) -> torch.device:
+        """Resuelve el dispositivo respetando la configuración del experimento."""
+        if device_config == "auto":
+            return torch.device(
+                "cuda" if torch.cuda.is_available() else "cpu"
+            )
+
+        if device_config == "cpu":
+            return torch.device("cpu")
+
+        if device_config == "cuda":
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    "Se solicitó el dispositivo 'cuda', "
+                    "pero CUDA no está disponible."
+                )
+            return torch.device("cuda")
+
+        raise ValueError(
+            f"Dispositivo no válido: {device_config!r}. "
+            "Opciones permitidas: 'auto', 'cpu' o 'cuda'."
+        )
+
 
     @staticmethod
     def _make_loader(
@@ -259,6 +318,8 @@ class ExperimentService:
             self.registry.update_run_status(run_id, "running")
 
             config = self._build_config(spec)
+            device = self._resolve_device(config.device)
+
             train_assignments = [
                 dataset
                 for dataset in spec.datasets
@@ -310,18 +371,19 @@ class ExperimentService:
                 requested_sources=active_source_names,
                 path_overrides=path_overrides,
                 create_missing_splits=True,
+                source_assignments=active_assignments,
             )
 
-            device = torch.device(
-                "cuda" if torch.cuda.is_available() else "cpu"
-            )
+
             model_spec = get_model_spec(spec.model_name)
+
             model = crear_modelo(
-                model_spec.architecture,
-                config.num_classes,
-                pretrained=model_spec.pretrained,
+                architecture=config.model.architecture,
+                num_classes=config.num_classes,
+                pretrained=config.model.pretrained,
                 dispositivo=device,
             )
+
             config = adaptar_normalizacion_a_modelo(config, model)
 
             train_transform = build_train_transform(config=config)
@@ -388,6 +450,15 @@ class ExperimentService:
                 },
                 "device": str(device),
                 "torch_version": str(torch.__version__),
+                "device": str(device),
+                "torch_version": str(torch.__version__),
+                "python_version": platform.python_version(),
+                "gpu_name": (
+                    torch.cuda.get_device_name(device)
+                    if device.type == "cuda"
+                    else None
+                ),
+                "cuda_version": torch.version.cuda,
             }
 
             config_payload = config.to_dict()
@@ -414,7 +485,7 @@ class ExperimentService:
                 cancel_event=cancel_event,
             )
 
-            
+
             # Medición de recursos del entrenamiento.
             if device.type == "cuda":
                 torch.cuda.synchronize(device)

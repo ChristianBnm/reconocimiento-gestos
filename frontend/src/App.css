@@ -728,3 +728,19 @@ footer {
   font-weight: 600;
   overflow-wrap: anywhere;
 }
+
+
+/* Dataset discovery */
+.resource-card-warning {
+  border-color: #f3c6c6;
+  background: #fffafa;
+}
+
+.resource-card-warning > span,
+.resource-card-warning .resource-detail {
+  color: #a94442;
+}
+
+.resource-card p {
+  overflow-wrap: anywhere;
+}

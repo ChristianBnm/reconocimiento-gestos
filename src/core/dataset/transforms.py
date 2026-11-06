@@ -48,7 +48,7 @@ def build_train_transform(
     size, mean, std, flip_probability, affine_probability, brightness_probability = (
         _resolve_config(image_size, config)
     )
-    transforms = [A.Resize(size, size)]
+    transforms = [A.Resize(height=size, width=size, interpolation=cv2.INTER_CUBIC,)]
     # El volteo está desactivado por defecto: algunas etiquetas pueden cambiar
     # de significado al reflejar una mano. Activarlo exige justificación por clase.
     if flip_probability > 0:
@@ -83,7 +83,7 @@ def build_eval_transform(
 
     size, mean, std, *_ = _resolve_config(image_size, config)
     return A.Compose([
-        A.Resize(size, size),
+        A.Resize(height=size, width=size, interpolation=cv2.INTER_CUBIC,),
         A.Normalize(mean=mean, std=std),
         ToTensorV2(),
     ])
@@ -110,7 +110,7 @@ def build_contour_transform(
     size, mean, std, flip_probability, affine_probability, brightness_probability = (
         _resolve_config(image_size, config)
     )
-    transforms = [A.Resize(size, size)]
+    transforms = [A.Resize(height=size, width=size, interpolation=cv2.INTER_CUBIC,)]
     if flip_probability > 0:
         transforms.append(A.HorizontalFlip(p=flip_probability))
     transforms.extend([
