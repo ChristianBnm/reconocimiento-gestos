@@ -95,6 +95,7 @@ function App() {
   const [models, setModels] = useState([]);
   const [sources, setSources] = useState([]);
   const [invalidSources, setInvalidSources] = useState([]);
+  const [refreshingSources, setRefreshingSources] = useState(false);
   const [runs, setRuns] = useState([]);
   const [runHistories, setRunHistories] = useState({});
   const [runsError, setRunsError] = useState("");
@@ -168,6 +169,30 @@ function App() {
       setRunsError(err.message);
     }
   }, []);
+
+  async function refreshSources() {
+    setRefreshingSources(true);
+    setError("");
+    try {
+      const sourceData = await request("/sources?refresh=true");
+      const discovered = Array.isArray(sourceData)
+        ? sourceData
+        : sourceData?.sources ?? [];
+      setSources(discovered);
+      setInvalidSources(
+        Array.isArray(sourceData?.invalid_sources)
+          ? sourceData.invalid_sources
+          : [],
+      );
+      setSuccess(
+        `Catálogo actualizado: ${discovered.length} dataset(s) válido(s).`,
+      );
+    } catch (err) {
+      setError(`No se pudo actualizar el catálogo de datasets: ${err.message}`);
+    } finally {
+      setRefreshingSources(false);
+    }
+  }
 
   const loadDashboard = useCallback(async () => {
     setError("");
@@ -398,6 +423,16 @@ function App() {
     setFormError("No se pudo resolver el vocabulario del dataset de entrenamiento.");
     return;
   }
+
+  console.log("Asignación de entrenamiento:", trainingAssignment);
+  console.log("Fuente resuelta:", trainingSource);
+  console.log(
+    "Fuentes disponibles:",
+    sources.map((source) => ({
+      name: source.name,
+      class_file: source.class_file,
+    }))
+  );
 
 const payload = {
   name: form.name.trim(),
@@ -1647,8 +1682,16 @@ const payload = {
           <div className="panel-heading">
             <div>
               <h2>Recursos disponibles</h2>
-              <p>Modelos y datasets detectados por el backend al iniciar.</p>
+              <p>Datasets detectados automáticamente dentro de la carpeta data/.</p>
             </div>
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={refreshSources}
+              disabled={refreshingSources}
+            >
+              {refreshingSources ? "Actualizando..." : "Actualizar datasets"}
+            </button>
           </div>
 
           <div className="resource-grid">
@@ -1679,6 +1722,7 @@ const payload = {
                     </span>
                     <span className="resource-detail">
                       {source.description}
+                      {source.origin === "automatic" ? " · Detectado automáticamente" : " · Configurado"}
                     </span>
                     <span className="resource-detail">
                       Clases: {(source.classes ?? []).join(", ")}

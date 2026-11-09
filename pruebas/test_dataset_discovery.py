@@ -82,3 +82,26 @@ def test_discovery_actualiza_catalogo_al_refrescar(tmp_path):
         item["name"] for item in refreshed_catalog["sources"]
     }
     assert "dataset_nuevo" in refreshed_names
+
+
+def test_discovery_refresh_reconoce_dataset_extendido_agregado_despues(tmp_path):
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    get_dataset_catalog(tmp_path, refresh=True)
+
+    extended = data_root / "dataset_extendido"
+    _crear_dataset(extended, ("0", "1", "A"))
+
+    # Sin refresh el catálogo conserva la instantánea anterior.
+    assert "dataset_extendido" not in {
+        item["name"] for item in get_dataset_catalog(tmp_path)["sources"]
+    }
+
+    refreshed = get_dataset_catalog(tmp_path, refresh=True)
+    source = next(
+        item for item in refreshed["sources"]
+        if item["name"] == "dataset_extendido"
+    )
+    assert source["classes"] == ["0", "1", "A"]
+    assert source["class_file"]
+    assert (tmp_path / source["class_file"]).is_file()

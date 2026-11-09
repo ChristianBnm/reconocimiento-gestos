@@ -1,0 +1,4665 @@
+﻿
+
+========== src\api\main.py ==========
+
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+
+from src.api.dependencies import PROJECT_ROOT
+from src.api.routes import evaluation, experiments, health, models, runs, sources
+from src.core.configuracion.discovery import get_dataset_catalog
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Detecta datasets al iniciar. La caché se mantiene hasta reiniciar el backend.
+    get_dataset_catalog(PROJECT_ROOT)
+    yield
+
+
+app = FastAPI(
+    title="LSA Gesture Recognition API",
+    description="Gestionar experimentos y ejecuciones de reconocimiento de gestos.",
+    version="0.2.0",
+    lifespan=lifespan,
+)
+
+app.include_router(health.router)
+app.include_router(models.router)
+app.include_router(sources.router)
+app.include_router(experiments.router)
+app.include_router(runs.router)
+app.include_router(evaluation.router)
+
+
+
+========== src\api\dependencies.py ==========
+
+import json
+from typing import Any
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from threading import Event, Lock
+
+from fastapi import HTTPException
+
+from src.core.experimentos.service import ExperimentService
+
+
+# Rai­z del proyecto: directorio que contiene src/.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+# Instancias compartidas por todos los routers.
+experiment_service = ExperimentService(root=PROJECT_ROOT)
+
+training_lock = Lock()
+
+run_cancel_events: dict[str, Event] = {}
+run_cancel_events_lock = Lock()
+
+executor = ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="lsa-training",
+)
+
+
+def run_experiment_task(experiment_id: str, run_id: str) -> None:
+    """Ejecuta el entrenamiento en segundo plano y libera recursos."""
+    try:
+        with run_cancel_events_lock:
+            cancel_event = run_cancel_events.get(run_id)
+        experiment_service.run_experiment(
+            experiment_id,
+            run_id=run_id,
+            cancel_event=cancel_event,
+        )
+    finally:
+        with run_cancel_events_lock:
+            run_cancel_events.pop(run_id, None)
+        training_lock.release()
+
+def read_artifact(run_id: str, filename: str) -> Any:
+    """Lee un artefacto JSON asociado a una ejecuciÃ³n."""
+    try:
+        run = experiment_service.get_run(run_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=str(exc),
+        ) from exc
+
+    artifact_path = (
+        PROJECT_ROOT
+        / "results"
+        / "experiments"
+        / run.experiment_id
+        / run.run_id
+        / filename
+    )
+
+    if not artifact_path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"TodavÃ­a no existe el artefacto '{filename}' "
+                f"para la ejecuciÃ³n {run_id}."
+            ),
+        )
+
+    try:
+        return json.loads(
+            artifact_path.read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"No se pudo leer {filename}.",
+        ) from exc
+
+
+
+========== src\api\routes\runs.py ==========
+
+
+from fastapi import APIRouter, HTTPException, Response, status
+from threading import Event
+
+from src.api.dependencies import (
+    executor,
+    experiment_service,
+    read_artifact,
+    run_experiment_task,
+    run_cancel_events,
+    run_cancel_events_lock,
+    training_lock,
+)
+
+router = APIRouter(tags=["Ejecuciones"])
+
+
+@router.post(
+    "/api/experiments/{experiment_id}/runs",
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def start_run(experiment_id: str, response: Response) -> dict:
+    try:
+        experiment_service.get_experiment(experiment_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    if not training_lock.acquire(blocking=False):
+        raise HTTPException(
+            status_code=409,
+            detail="Ya hay un entrenamiento o evaluación en curso.",
+        )
+
+    try:
+        run = experiment_service.create_run(experiment_id)
+        with run_cancel_events_lock:
+            run_cancel_events[run.run_id] = Event()
+
+        try:
+            executor.submit(
+                run_experiment_task,
+                experiment_id,
+                run.run_id,
+            )
+        except Exception:
+            with run_cancel_events_lock:
+                run_cancel_events.pop(run.run_id, None)
+            experiment_service.registry.update_run_status(
+                run.run_id,
+                "failed",
+                error_message=(
+                    "No se pudo iniciar la tarea de entrenamiento."
+                ),
+            )
+            raise
+
+    except Exception as exc:
+        training_lock.release()
+
+        if isinstance(exc, HTTPException):
+            raise
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"No se pudo iniciar el entrenamiento: {exc}",
+        ) from exc
+
+    response.headers["Location"] = f"/api/runs/{run.run_id}"
+
+    return run.to_dict()
+
+
+@router.get("/api/runs")
+def list_runs(experiment_id: str | None = None) -> list[dict]:
+    try:
+        return [
+            run.to_dict()
+            for run in experiment_service.list_runs(experiment_id)
+        ]
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get("/api/runs/{run_id}")
+def get_run(run_id: str) -> dict:
+    try:
+        return experiment_service.get_run(run_id).to_dict()
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.post("/api/runs/{run_id}/cancel", status_code=status.HTTP_202_ACCEPTED)
+def cancel_run(run_id: str) -> dict:
+    try:
+        run = experiment_service.get_run(run_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    if run.status not in {"pending", "running"}:
+        raise HTTPException(
+            status_code=409,
+            detail=f"No se puede detener una ejecución con estado '{run.status}'.",
+        )
+
+    with run_cancel_events_lock:
+        cancel_event = run_cancel_events.get(run_id)
+        if cancel_event is None:
+            raise HTTPException(
+                status_code=409,
+                detail="No hay una señal de cancelación activa para esta ejecución.",
+            )
+        cancel_event.set()
+
+    return {"run_id": run_id, "status": "cancellation_requested"}
+
+
+@router.get("/api/runs/{run_id}/history")
+def get_run_history(run_id: str) -> list[dict]:
+    return read_artifact(run_id, "history.json")
+
+
+@router.get("/api/runs/{run_id}/config")
+def get_run_config(run_id: str) -> dict:
+    return read_artifact(run_id, "config.json")
+
+
+@router.get("/api/runs/{run_id}/results")
+def get_run_results(run_id: str) -> dict:
+    return read_artifact(run_id, "evaluation.json")
+
+
+
+========== src\api\routes\experiments.py ==========
+
+from fastapi import APIRouter, HTTPException, Response, status
+from src.api.dependencies import experiment_service
+from src.core.experimentos.schemas import ExperimentSpec
+
+router = APIRouter(tags=["Experimentos"])
+
+
+@router.post(
+    "/api/experiments",
+    status_code=status.HTTP_201_CREATED,
+)
+
+def create_experiment(payload: dict) -> dict:
+    try:
+        data = dict(payload)
+
+        if not data.get("experiment_id"):
+            model_name = data.get("model_name")
+
+            if not isinstance(model_name, str) or not model_name.strip():
+                raise ValueError(
+                    "model_name es obligatorio para generar la ID."
+                )
+
+            data["experiment_id"] = (
+                experiment_service.next_experiment_id(model_name)
+            )
+
+        spec = ExperimentSpec.from_dict(data)
+
+        return experiment_service.create_experiment(spec).to_dict()
+
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except (ValueError, TypeError, KeyError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except FileExistsError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.get("/api/experiments")
+def list_experiments() -> list[dict]:
+    result = []
+
+    for experiment_id in experiment_service.list_experiments():
+        spec = experiment_service.get_experiment(experiment_id)
+        result.append(spec.to_dict())
+
+    return result
+
+
+@router.get("/api/experiments/{experiment_id}")
+def get_experiment(experiment_id: str) -> dict:
+    try:
+        return experiment_service.get_experiment(
+            experiment_id
+        ).to_dict()
+
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.delete(
+    "/api/experiments/{experiment_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+
+def delete_experiment(experiment_id: str) -> Response:
+    try:
+        experiment_service.delete_experiment(experiment_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+========== src\api\routes\sources.py ==========
+
+from fastapi import APIRouter
+
+from src.api.dependencies import PROJECT_ROOT
+from src.core.configuracion.catalogo import cargar_catalogos
+from src.core.configuracion.discovery import get_dataset_catalog
+
+router = APIRouter(tags=["Datos"])
+
+
+@router.get("/api/sources")
+def get_sources() -> dict:
+    """Devuelve los datasets válidos detectados y los rechazados con su motivo."""
+    _, scenarios = cargar_catalogos()
+    catalog = get_dataset_catalog(PROJECT_ROOT)
+
+    return {
+        "sources": catalog["sources"],
+        "invalid_sources": catalog["invalid_sources"],
+        "scenarios": [
+            {
+                "name": name,
+                "description": spec.get("description", ""),
+                "sources": spec["sources"],
+            }
+            for name, spec in scenarios.items()
+        ],
+    }
+
+
+
+========== src\core\configuracion\discovery.py ==========
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import os
+import re
+import tempfile
+from functools import lru_cache
+from pathlib import Path
+from typing import Sequence
+
+from src.core.configuracion.catalogo import cargar_catalogos
+from src.core.configuracion.settings import cargar_clases
+from src.core.dataset.loader import IMAGE_EXTENSIONS
+
+
+IGNORED_DIRECTORY_NAMES = {".git", "__pycache__", ".ipynb_checkpoints"}
+
+
+def _resolve_project_path(root: Path, raw_path: str) -> Path:
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute():
+        path = root / path
+    return path.resolve()
+
+
+def inspect_dataset_directory(
+    dataset_path: str | Path,
+    expected_class_names: Sequence[str] | None = None,
+) -> dict:
+    """Inspecciona la estructura por carpetas sin cargar imágenes en memoria.
+
+    Cada subdirectorio inmediato del dataset debe representar una clase y
+    contener al menos una imagen soportada directamente dentro de esa carpeta.
+    La decodificación completa de las imágenes continúa a cargo de GestosDataset
+    cuando se prepara una ejecución.
+    """
+    root = Path(dataset_path).expanduser().resolve()
+    if not root.exists():
+        raise FileNotFoundError(f"No existe el directorio del dataset: {root}")
+    if not root.is_dir():
+        raise NotADirectoryError(f"La ruta del dataset no es una carpeta: {root}")
+
+    class_dirs = sorted(
+        (
+            child for child in root.iterdir()
+            if child.is_dir()
+            and not child.name.startswith(".")
+            and child.name not in IGNORED_DIRECTORY_NAMES
+        ),
+        key=lambda item: (item.name.casefold(), item.name),
+    )
+    if not class_dirs:
+        raise ValueError(
+            "No se encontraron carpetas de clases. Se espera una carpeta por clase."
+        )
+
+    names_by_casefold: dict[str, Path] = {}
+    for directory in class_dirs:
+        key = directory.name.casefold()
+        if key in names_by_casefold:
+            raise ValueError(
+                "Hay carpetas de clases que solo se diferencian por mayúsculas/minúsculas: "
+                f"'{names_by_casefold[key].name}' y '{directory.name}'."
+            )
+        names_by_casefold[key] = directory
+
+    if expected_class_names is None:
+        class_names = tuple(directory.name for directory in class_dirs)
+    else:
+        class_names = tuple(expected_class_names)
+        if not class_names or len(set(class_names)) != len(class_names):
+            raise ValueError("El vocabulario esperado está vacío o contiene duplicados.")
+        actual_names = {directory.name for directory in class_dirs}
+        expected_names = set(class_names)
+        missing = sorted(expected_names - actual_names)
+        extra = sorted(actual_names - expected_names)
+        if missing or extra:
+            details = []
+            if missing:
+                details.append("faltan clases: " + ", ".join(missing))
+            if extra:
+                details.append("sobran carpetas: " + ", ".join(extra))
+            raise ValueError("La estructura no coincide con el vocabulario: " + "; ".join(details))
+
+    image_counts: dict[str, int] = {}
+    for class_name in class_names:
+        class_dir = root / class_name
+        if not class_dir.is_dir():
+            raise ValueError(f"No existe la carpeta de la clase '{class_name}'.")
+
+        images = sorted(
+            (
+                item for item in class_dir.iterdir()
+                if item.is_file() and item.suffix.casefold() in IMAGE_EXTENSIONS
+            ),
+            key=lambda item: item.name.casefold(),
+        )
+        if not images:
+            nested_images = any(
+                child.is_dir() and any(
+                    file.is_file() and file.suffix.casefold() in IMAGE_EXTENSIONS
+                    for file in child.rglob("*")
+                )
+                for child in class_dir.iterdir()
+            )
+            if nested_images:
+                raise ValueError(
+                    f"La clase '{class_name}' contiene imágenes en subcarpetas. "
+                    "El loader espera los archivos directamente dentro de cada clase."
+                )
+            raise ValueError(f"La carpeta de clase '{class_name}' no contiene imágenes.")
+
+        empty_files = [image.name for image in images if image.stat().st_size == 0]
+        if empty_files:
+            raise ValueError(
+                f"La clase '{class_name}' contiene archivos de imagen vacíos: "
+                + ", ".join(empty_files[:5])
+            )
+        image_counts[class_name] = len(images)
+
+    root_images = [
+        item.name for item in root.iterdir()
+        if item.is_file() and item.suffix.casefold() in IMAGE_EXTENSIONS
+    ]
+    if root_images:
+        raise ValueError(
+            "Hay imágenes directamente en la raíz del dataset. "
+            "Cada imagen debe estar dentro de una carpeta de clase: "
+            + ", ".join(sorted(root_images)[:5])
+        )
+
+    return {
+        "class_names": class_names,
+        "images_by_class": image_counts,
+        "num_classes": len(class_names),
+        "num_images": sum(image_counts.values()),
+    }
+
+
+def _write_class_manifest(
+    project_root: Path,
+    source_name: str,
+    dataset_path: Path,
+    class_names: Sequence[str],
+) -> str:
+    """Escribe un vocabulario inmutable y direccionado por contenido."""
+    payload = {"classes": list(class_names)}
+    signature = json.dumps(
+        {
+            "source_name": source_name,
+            "dataset_path": str(dataset_path.resolve()),
+            "classes": list(class_names),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    ).encode("utf-8")
+    digest = hashlib.sha256(signature).hexdigest()[:12]
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", source_name).strip("._-") or "dataset"
+    manifest_dir = project_root / "results" / "dataset_catalog"
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = manifest_dir / f"{safe_name}-{digest}.classes.json"
+
+    if not manifest_path.is_file():
+        fd, temporary = tempfile.mkstemp(
+            prefix=f".{manifest_path.name}.", suffix=".tmp", dir=manifest_dir
+        )
+        temporary_path = Path(temporary)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(payload, stream, ensure_ascii=False, indent=2)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary_path, manifest_path)
+        except BaseException:
+            temporary_path.unlink(missing_ok=True)
+            raise
+
+    return manifest_path.relative_to(project_root).as_posix()
+
+
+def _discover_uncached(project_root_text: str) -> dict:
+    project_root = Path(project_root_text).resolve()
+    data_root = project_root / "data"
+    configured_sources, _ = cargar_catalogos()
+    default_classes = cargar_clases()
+
+    valid_sources: list[dict] = []
+    invalid_sources: list[dict] = []
+    configured_paths: set[Path] = set()
+    known_names: set[str] = set()
+
+    for source_name, definition in configured_sources.items():
+        dataset_path = _resolve_project_path(project_root, definition["path"])
+        configured_paths.add(dataset_path)
+        known_names.add(source_name.casefold())
+        try:
+            inspection = inspect_dataset_directory(dataset_path, default_classes)
+            valid_sources.append({
+                "name": source_name,
+                "path": dataset_path.relative_to(project_root).as_posix()
+                if dataset_path.is_relative_to(project_root) else str(dataset_path),
+                "description": definition.get("description", "Fuente configurada"),
+                "class_file": None,
+                "classes": list(inspection["class_names"]),
+                "num_classes": inspection["num_classes"],
+                "num_images": inspection["num_images"],
+                "images_by_class": inspection["images_by_class"],
+                "deduplicate_exact_duplicates": definition.get(
+                    "deduplicate_exact_duplicates", True
+                ),
+                "origin": "configured",
+            })
+        except (OSError, ValueError, RuntimeError) as exc:
+            invalid_sources.append({
+                "name": source_name,
+                "path": definition["path"],
+                "reason": str(exc),
+                "origin": "configured",
+            })
+
+    if data_root.is_dir():
+        for dataset_path in sorted(data_root.iterdir(), key=lambda item: item.name.casefold()):
+            if (
+                not dataset_path.is_dir()
+                or dataset_path.name.startswith(".")
+                or dataset_path.name in IGNORED_DIRECTORY_NAMES
+            ):
+                continue
+
+            resolved_path = dataset_path.resolve()
+            if resolved_path in configured_paths:
+                continue
+
+            source_name = dataset_path.name
+            if source_name.casefold() in known_names:
+                invalid_sources.append({
+                    "name": source_name,
+                    "path": dataset_path.relative_to(project_root).as_posix(),
+                    "reason": "El nombre del directorio entra en conflicto con una fuente configurada.",
+                    "origin": "automatic",
+                })
+                continue
+
+            try:
+                inspection = inspect_dataset_directory(resolved_path)
+                class_file = _write_class_manifest(
+                    project_root,
+                    source_name,
+                    resolved_path,
+                    inspection["class_names"],
+                )
+                valid_sources.append({
+                    "name": source_name,
+                    "path": resolved_path.relative_to(project_root).as_posix(),
+                    "description": "Dataset detectado automáticamente en data/.",
+                    "class_file": class_file,
+                    "classes": list(inspection["class_names"]),
+                    "num_classes": inspection["num_classes"],
+                    "num_images": inspection["num_images"],
+                    "images_by_class": inspection["images_by_class"],
+                    "deduplicate_exact_duplicates": True,
+                    "origin": "automatic",
+                })
+                known_names.add(source_name.casefold())
+            except (OSError, ValueError, RuntimeError) as exc:
+                invalid_sources.append({
+                    "name": source_name,
+                    "path": resolved_path.relative_to(project_root).as_posix(),
+                    "reason": str(exc),
+                    "origin": "automatic",
+                })
+
+    return {"sources": valid_sources, "invalid_sources": invalid_sources}
+
+
+@lru_cache(maxsize=8)
+def _cached_dataset_catalog(project_root_text: str) -> dict:
+    return _discover_uncached(project_root_text)
+
+
+def get_dataset_catalog(
+    project_root: str | Path,
+    *,
+    refresh: bool = False,
+) -> dict:
+    """Devuelve el catálogo detectado; se calcula una vez por proceso/root."""
+    root_text = str(Path(project_root).expanduser().resolve())
+    if refresh:
+        _cached_dataset_catalog.cache_clear()
+    return copy.deepcopy(_cached_dataset_catalog(root_text))
+
+
+def clear_dataset_catalog_cache() -> None:
+    """Limpia la caché (útil para pruebas automatizadas)."""
+    _cached_dataset_catalog.cache_clear()
+
+
+def get_source_definitions(project_root: str | Path) -> dict[str, dict]:
+    """Adapta el catálogo detectado al formato usado por prepare_sources()."""
+    definitions: dict[str, dict] = {}
+    for source in get_dataset_catalog(project_root)["sources"]:
+        definitions[source["name"]] = {
+            "path": source["path"],
+            "description": source["description"],
+            "deduplicate_exact_duplicates": source["deduplicate_exact_duplicates"],
+        }
+    return definitions
+
+
+
+========== src\core\configuracion\settings.py ==========
+
+from __future__ import annotations
+
+import json
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Literal
+from typing import Mapping, Sequence
+
+
+_CONFIG_DIR = Path(__file__).resolve().parent
+_CLASS_FILE = _CONFIG_DIR / "clases.json"
+
+
+def cargar_clases(path: str | Path | None = None) -> tuple[str, ...]:
+    """Carga el vocabulario en tiempo de ejecución, nunca al importar el módulo.
+
+    Se acepta el formato histórico (lista JSON) y el formato extensible
+    {"classes": [..]}. El orden del archivo es el orden de los índices.
+    """
+    class_file = Path(path) if path else _CLASS_FILE
+    if not class_file.is_absolute() and not class_file.exists():
+        class_file = Path.cwd() / class_file
+    if not class_file.is_file():
+        raise FileNotFoundError(f"No se encontró el archivo de clases: {class_file}")
+
+    with class_file.open("r", encoding="utf-8") as file:
+        payload = json.load(file)
+
+    if isinstance(payload, Mapping):
+        payload = payload.get("classes")
+    if not isinstance(payload, list) or not payload:
+        raise ValueError("El archivo de clases debe contener una lista JSON no vacía.")
+
+    names = tuple(str(name).strip() for name in payload)
+    if any(not name for name in names):
+        raise ValueError("Los nombres de las clases no pueden estar vacíos.")
+    if len(set(names)) != len(names):
+        raise ValueError("El archivo de clases contiene nombres duplicados.")
+    if any(name in {".", ".."} or "/" in name or "\\" in name for name in names):
+        raise ValueError("Los nombres de clase no pueden contener separadores de ruta.")
+    return names
+
+
+CLASS_NAMES: tuple[str, ...] = cargar_clases()
+
+
+@dataclass(frozen=True)
+class ModelSpec:
+    name: str
+    architecture: str
+    family: str
+    pretrained: bool = True
+
+
+MODEL_REGISTRY: dict[str, ModelSpec] = {
+    "mobilenetv2": ModelSpec("mobilenetv2", "mobilenetv2_100", "CNN"),
+    "densenet201": ModelSpec("densenet201", "densenet201", "CNN"),
+    "vit_tiny": ModelSpec("vit_tiny", "vit_tiny_patch16_224", "Vision Transformer"),
+    "vit_base": ModelSpec("vit_base", "vit_base_patch16_224", "Vision Transformer"),
+}
+
+
+@dataclass(frozen=True)
+class ExperimentConfig:
+    model: ModelSpec
+    class_names: tuple[str, ...] = field(default_factory=lambda: CLASS_NAMES)
+    image_size: int = 224
+    train_size: float = 0.70
+    val_size: float = 0.15
+    test_size: float = 0.15
+    seed: int = 42
+    split_seed: int = 42
+    batch_size: int = 32
+    learning_rate: float = 0.001
+    weight_decay: float = 0.0001
+    epochs: int = 30
+    patience: int = 5
+    min_delta: float = 0.0
+    num_workers: int = 0
+    pin_memory: bool = True
+    freeze_backbone: bool = True
+    horizontal_flip_probability: float = 0.0
+    affine_probability: float = 0.5
+    brightness_contrast_probability: float = 0.2
+    normalization_mean: tuple[float, float, float] = (0.485, 0.456, 0.406)
+    normalization_std: tuple[float, float, float] = (0.229, 0.224, 0.225)
+    device: Literal["auto", "cpu", "cuda"] = "auto"
+
+    def __post_init__(self) -> None:
+        if not self.class_names:
+            raise ValueError("El vocabulario debe contener al menos una clase.")
+        if len(set(self.class_names)) != len(self.class_names):
+            raise ValueError("class_names contiene clases duplicadas.")
+        if self.image_size <= 0 or self.batch_size <= 0 or self.epochs <= 0:
+            raise ValueError("image_size, batch_size y epochs deben ser positivos.")
+        if self.patience < 1 or self.num_workers < 0:
+            raise ValueError("patience debe ser >= 1 y num_workers >= 0.")
+        ratios = (self.train_size, self.val_size, self.test_size)
+        if any(ratio <= 0 or ratio >= 1 for ratio in ratios):
+            raise ValueError("Las proporciones de train, val y test deben estar entre 0 y 1.")
+        if abs(sum(ratios) - 1.0) > 1e-6:
+            raise ValueError("Las proporciones de train, val y test deben sumar 1.")
+        if self.learning_rate <= 0 or self.weight_decay < 0 or self.min_delta < 0:
+            raise ValueError("learning_rate debe ser positivo; weight_decay y min_delta no pueden ser negativos.")
+        for field_name in (
+            "horizontal_flip_probability",
+            "affine_probability",
+            "brightness_contrast_probability",
+        ):
+            value = getattr(self, field_name)
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"{field_name} debe estar entre 0 y 1.")
+        if len(self.normalization_mean) != 3 or len(self.normalization_std) != 3:
+            raise ValueError("La normalización debe tener tres canales RGB.")
+        if any(value <= 0 for value in self.normalization_std):
+            raise ValueError("Los valores de desviación estándar deben ser positivos.")
+        if self.device not in {"auto", "cpu", "cuda"}:
+            raise ValueError(
+        "device debe ser 'auto', 'cpu' o 'cuda'."
+        )
+
+    @property
+    def num_classes(self) -> int:
+        return len(self.class_names)
+
+    @property
+    def class_to_idx(self) -> dict[str, int]:
+        return {name: index for index, name in enumerate(self.class_names)}
+
+    def to_dict(self) -> dict:
+        data = asdict(self)
+        data["num_classes"] = self.num_classes
+        data["class_to_idx"] = self.class_to_idx
+        return data
+
+
+def get_model_spec(name: str) -> ModelSpec:
+    try:
+        return MODEL_REGISTRY[name]
+    except KeyError as exc:
+        available = ", ".join(MODEL_REGISTRY)
+        raise ValueError(f"Modelo '{name}' no soportado. Disponibles: {available}") from exc
+
+
+def list_models() -> list[str]:
+    return list(MODEL_REGISTRY)
+
+
+def build_experiment_config(
+    model_name: str,
+    class_names: Sequence[str] | None = None,
+    **overrides,
+) -> ExperimentConfig:
+    spec = get_model_spec(model_name)
+    names = tuple(class_names) if class_names is not None else CLASS_NAMES
+    return ExperimentConfig(model=spec, class_names=names, **overrides)
+
+
+def project_root() -> Path:
+    return Path(__file__).resolve().parents[3]
+
+
+
+========== src\core\dataset\experiment.py ==========
+
+from __future__ import annotations
+
+import csv
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Mapping, Sequence
+from src.core.experimentos.schemas import DatasetAssignment
+
+from src.core.configuracion.catalogo import cargar_catalogos, construir_mapa_fuentes
+from src.core.configuracion.discovery import get_source_definitions
+from src.core.configuracion.settings import ExperimentConfig
+from src.core.dataset.loader import DatasetSubset, GestosDataset
+from src.core.utils.paths import ProjectPaths
+
+from src.core.dataset.split import (
+    DatasetSplit, cargar_split, dataset_fingerprint, dividir_dataset, guardar_split
+)
+
+from src.core.dataset.global_inventory import (
+    build_global_inventory,
+    validate_global_preflight,
+)
+
+
+SOURCE_DEFINITIONS, SCENARIO_DEFINITIONS = cargar_catalogos()
+SCENARIO_SOURCES: dict[str, tuple[str, ...]] = {
+    name: tuple(spec["sources"]) for name, spec in SCENARIO_DEFINITIONS.items()
+}
+SOURCE_NAMES = tuple(SOURCE_DEFINITIONS)
+
+
+@dataclass
+class PreparedSource:
+    name: str
+    dataset: GestosDataset
+    split: DatasetSplit | None
+    split_path: Path | None
+
+
+def source_paths(
+    paths: ProjectPaths,
+    overrides: Mapping[str, str | Path] | None = None,
+    source_definitions: Mapping[str, dict] | None = None,
+):
+    definitions = source_definitions or get_source_definitions(paths.root)
+    return construir_mapa_fuentes(paths.root, definitions, overrides)
+
+
+def prepare_sources(
+    paths: ProjectPaths,
+    config: ExperimentConfig,
+    requested_sources: Sequence[str] = SOURCE_NAMES,
+    path_overrides: Mapping[str, str | Path] | None = None,
+    create_missing_splits: bool = False,
+    regenerate_splits: bool = False,
+    source_assignments: Sequence | None = None,
+) -> dict[str, PreparedSource]:
+    source_definitions = get_source_definitions(paths.root)
+    unknown = sorted(set(requested_sources) - set(source_definitions))
+    if unknown:
+        raise ValueError(f"Fuentes desconocidas o no válidas: {', '.join(unknown)}")
+
+    locations = source_paths(paths, path_overrides, source_definitions)
+
+    if source_assignments is not None:
+        inventory_assignments = [
+            DatasetAssignment(
+                source_name=assignment.source_name,
+                path=str(locations[assignment.source_name]),
+                role=assignment.role,
+            )
+            for assignment in source_assignments
+            if assignment.role != "unused"
+        ]
+
+        inventory = build_global_inventory(
+            assignments=inventory_assignments,
+            class_names=config.class_names,
+        )
+    else:
+        inventory = None
+
+    if source_assignments is not None:
+        missing_sources = {
+            assignment.source_name
+            for assignment in source_assignments
+            if assignment.role != "unused"
+        } - set(requested_sources)
+
+        if missing_sources:
+            raise ValueError(
+                "Hay fuentes activas que no se prepararán: "
+                + ", ".join(sorted(missing_sources))
+            )
+
+    excluded_paths_by_source: dict[str, set[Path]] = {}
+
+    training_sources = (
+        [
+            assignment.source_name
+            for assignment in source_assignments
+            if assignment.role == "train_source"
+        ]
+        if source_assignments is not None
+        else None
+    )
+
+    roles_by_source = {
+        assignment.source_name: assignment.role
+        for assignment in source_assignments
+    } if source_assignments is not None else {}
+
+    if inventory is not None:
+        validate_global_preflight(
+            inventory=inventory,
+        class_names=config.class_names,
+        train_size=config.train_size,
+        val_size=config.val_size,
+        test_size=config.test_size,
+        seed=config.split_seed,
+        training_sources=training_sources,
+    )
+
+        for excluded in inventory.excluded_training_copies:
+            excluded_paths_by_source.setdefault(
+            excluded.source_name, set()
+        ).add(excluded.path.resolve())
+
+        _guardar_manifest_exclusiones_globales(
+            inventory,
+            paths.root / "manifests" / "exclusiones_globales.csv",
+        )
+
+    prepared: dict[str, PreparedSource] = {}
+
+    for name in requested_sources:
+        dataset = GestosDataset(
+            locations[name],
+            transformacion=None,
+            class_names=config.class_names,
+            source_names=[name],
+            require_all_classes=True,
+            deduplicate_exact_duplicates=source_definitions[name].get(
+                "deduplicate_exact_duplicates", True
+            ),
+            excluded_paths=excluded_paths_by_source.get(name, set()),
+        )
+
+        fingerprint = dataset_fingerprint(dataset)
+
+        split_config_path = paths.source_split_path(
+            name,
+            dataset_fingerprint=fingerprint,
+            seed=config.split_seed,
+            train_size=config.train_size,
+            val_size=config.val_size,
+            test_size=config.test_size,
+        )
+
+        is_training_source = (
+            roles_by_source.get(name, "train_source") == "train_source"
+        )
+
+        _guardar_manifest_duplicados(
+            dataset,
+            split_config_path.with_suffix(".duplicados_exactos.csv"),
+        )
+
+        if is_training_source:
+            split_path = split_config_path
+
+            if regenerate_splits or not split_path.exists():
+                if not create_missing_splits and not regenerate_splits:
+                    raise FileNotFoundError(
+                        f"No existe la partición de '{name}': {split_path}. "
+                        "Entrená primero o autorizá la creación de particiones."
+                    )
+
+                split = dividir_dataset(
+                    dataset.etiquetas,
+                    config.train_size,
+                    config.val_size,
+                    config.test_size,
+                    config.split_seed,
+                    grupos=[
+                        record.group_id
+                        for record in dataset.records
+                    ],
+                )
+
+                guardar_split(
+                    split_path,
+                    split,
+                    dataset,
+                    config.split_seed,
+                    config.train_size,
+                    config.val_size,
+                    config.test_size,
+                )
+
+            else:
+                split = cargar_split(
+                    split_path,
+                    dataset,
+                    expected_seed=config.split_seed,
+                    train_size=config.train_size,
+                    val_size=config.val_size,
+                    test_size=config.test_size,
+                )
+
+        else:
+            split = None
+            split_path = None
+
+        prepared[name] = PreparedSource(
+            name,
+            dataset,
+            split,
+            split_path,
+        )
+
+        _validate_group_partition_consistency(
+            prepared,
+            training_sources=(
+            set(training_sources)
+            if training_sources is not None
+            else None
+            ),
+        )
+
+    return prepared
+
+
+def _guardar_manifest_duplicados(dataset: GestosDataset, ruta: Path) -> None:
+    """Registra las copias exactas omitidas en memoria; nunca borra archivos fuente."""
+    ruta.parent.mkdir(parents=True, exist_ok=True)
+    with ruta.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.writer(file)
+        writer.writerow([
+            "fuente", "clase", "ruta_conservada", "ruta_duplicada_excluida", "sha256", "motivo"
+        ])
+        for duplicate in dataset.excluded_duplicates:
+            writer.writerow([
+                duplicate.source,
+                duplicate.class_name,
+                duplicate.kept_relative_path,
+                duplicate.relative_path,
+                duplicate.group_id,
+                "duplicado_exacto_sha256",
+            ])
+
+
+def _guardar_manifest_exclusiones_globales(inventory, ruta: Path) -> None:
+    """Audita las copias de entrenamiento excluidas por deduplicación global."""
+    ruta.parent.mkdir(parents=True, exist_ok=True)
+
+    with ruta.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.writer(file)
+        writer.writerow([
+            "fuente_excluida",
+            "clase",
+            "ruta_duplicada_excluida",
+            "fuente_conservada",
+            "ruta_conservada",
+            "sha256",
+            "motivo",
+        ])
+
+        for excluded in inventory.excluded_training_copies:
+            writer.writerow([
+                excluded.source_name,
+                excluded.class_name,
+                excluded.relative_path,
+                excluded.kept_source_name,
+                excluded.kept_relative_path,
+                excluded.sha256,
+                excluded.reason,
+            ])
+
+
+
+def _validate_group_partition_consistency(
+    sources: Mapping[str, PreparedSource],
+    training_sources: set[str] | None = None,
+) -> None:
+    """Detecta duplicados entre particiones de las fuentes de entrenamiento."""
+
+    assignments: dict[str, tuple[str, str, Path, int]] = {}
+
+    for source_name, source in sources.items():
+        if training_sources is not None and source_name not in training_sources:
+            continue
+
+        if source.split is None:
+            continue
+
+        split_by_index: dict[int, str] = {}
+
+        for partition_name in ("train", "val", "test"):
+            for index in getattr(source.split, partition_name):
+                split_by_index[index] = partition_name
+
+        for index, record in enumerate(source.dataset.records):
+            partition = split_by_index[index]
+            previous = assignments.get(record.group_id)
+
+            if previous and previous[3] != record.label:
+                raise ValueError(
+                    "Se detectó contenido idéntico etiquetado con clases "
+                    "distintas entre fuentes de entrenamiento: "
+                    f"{previous[2]} ({previous[3]}) y "
+                    f"{record.path} ({record.label}). "
+                    "Resolvé la inconsistencia de etiquetas antes de entrenar."
+                )
+
+            if previous and previous[0] != partition:
+                raise ValueError(
+                    "Se detectó una imagen idéntica asignada a particiones "
+                    "distintas entre fuentes de entrenamiento: "
+                    f"{previous[2]} ({previous[0]}) y "
+                    f"{record.path} ({partition}). "
+                    "Para evitar fuga de datos, revisá los duplicados y "
+                    "regenerá las particiones después de resolverlos."
+                )
+
+            if previous is None:
+                assignments[record.group_id] = (
+                    partition,
+                    source_name,
+                    record.path,
+                    record.label,
+                )
+
+
+def subset_for(
+    source: PreparedSource,
+    partition: str,
+    transform=None,
+) -> DatasetSubset:
+    if partition not in {"train", "val", "test"}:
+        raise ValueError(f"Partición desconocida: {partition}")
+
+    if source.split is None:
+        raise ValueError(
+            f"La fuente '{source.name}' no tiene particiones internas."
+        )
+
+    return DatasetSubset(
+        source.dataset,
+        getattr(source.split, partition),
+        transform,
+    )
+
+def full_dataset_for(
+    source: PreparedSource,
+    transform=None,
+) -> DatasetSubset:
+    """Devuelve la fuente completa, sin aplicar particiones internas."""
+    return DatasetSubset(
+        source.dataset,
+        range(len(source.dataset)),
+        transform,
+    )
+
+
+========== src\core\dataset\split.py ==========
+
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Sequence
+
+from sklearn.model_selection import train_test_split
+
+from src.core.utils.io import save_json
+
+
+@dataclass(frozen=True)
+class DatasetSplit:
+    train: list[int]
+    val: list[int]
+    test: list[int]
+
+    def total(self) -> int:
+        return len(self.train) + len(self.val) + len(self.test)
+
+    def validate(self, dataset_size: int) -> None:
+        parts = {"train": self.train, "val": self.val, "test": self.test}
+        flattened: list[int] = []
+        for name, indices in parts.items():
+            if not indices:
+                raise ValueError(f"La partición '{name}' está vacía.")
+            if any(index < 0 or index >= dataset_size for index in indices):
+                raise ValueError(f"La partición '{name}' contiene índices fuera del dataset.")
+            flattened.extend(indices)
+        if len(flattened) != len(set(flattened)):
+            raise ValueError("Hay índices repetidos o solapados entre particiones.")
+        if set(flattened) != set(range(dataset_size)):
+            raise ValueError("Las particiones no cubren exactamente el dataset completo.")
+
+
+def _validate_ratios(train_size: float, val_size: float, test_size: float) -> None:
+    if any(ratio <= 0 or ratio >= 1 for ratio in (train_size, val_size, test_size)):
+        raise ValueError("Las proporciones de train, val y test deben estar entre 0 y 1.")
+    if abs(train_size + val_size + test_size - 1.0) > 1e-6:
+        raise ValueError("train_size + val_size + test_size debe ser igual a 1.0")
+
+
+def dividir_dataset(
+    etiquetas: Sequence[int],
+    train_size: float,
+    val_size: float,
+    test_size: float,
+    seed: int,
+    grupos: Sequence[str] | None = None,
+) -> DatasetSplit:
+    """Divide un dataset sin separar copias con el mismo identificador de grupo.
+
+    La estratificación se realiza por grupo (no por imagen) si se pasan grupos.
+    Cada grupo debe pertenecer a una sola clase; grupos conflictivos se rechazan.
+    """
+    _validate_ratios(train_size, val_size, test_size)
+    if len(etiquetas) == 0:
+        raise ValueError("No se puede particionar un dataset vacío.")
+    if grupos is not None and len(grupos) != len(etiquetas):
+        raise ValueError("La cantidad de grupos debe coincidir con la cantidad de etiquetas.")
+
+    indices = list(range(len(etiquetas)))
+    if grupos is None:
+        train_indices, temp_indices = _stratified_split(
+            indices, list(etiquetas), val_size + test_size, seed
+        )
+        val_fraction = val_size / (val_size + test_size)
+        val_indices, test_indices = _stratified_split(
+            temp_indices,
+            [etiquetas[index] for index in temp_indices],
+            1.0 - val_fraction,
+            seed,
+        )
+    else:
+        group_to_indices: dict[str, list[int]] = {}
+        group_to_label: dict[str, int] = {}
+        for index, (label, group) in enumerate(zip(etiquetas, grupos)):
+            group = str(group)
+            group_to_indices.setdefault(group, []).append(index)
+            previous = group_to_label.setdefault(group, int(label))
+            if previous != int(label):
+                raise ValueError(
+                    "Se detectó contenido idéntico asignado a clases distintas; "
+                    f"grupo {group!r} tiene etiquetas {previous} y {label}."
+                )
+        group_ids = sorted(group_to_indices)
+        group_labels = [group_to_label[group] for group in group_ids]
+        train_groups, temp_groups = _stratified_split(
+            group_ids, group_labels, val_size + test_size, seed
+        )
+        temp_label_by_group = {group: group_to_label[group] for group in temp_groups}
+        val_fraction = val_size / (val_size + test_size)
+        val_groups, test_groups = _stratified_split(
+            temp_groups,
+            [temp_label_by_group[group] for group in temp_groups],
+            1.0 - val_fraction,
+            seed,
+        )
+
+        def expand(groups_for_split):
+            return sorted(index for group in groups_for_split for index in group_to_indices[group])
+
+        train_indices = expand(train_groups)
+        val_indices = expand(val_groups)
+        test_indices = expand(test_groups)
+
+    result = DatasetSplit(
+        train=sorted(train_indices),
+        val=sorted(val_indices),
+        test=sorted(test_indices),
+    )
+    result.validate(len(etiquetas))
+    if grupos is not None:
+        group_partition: dict[str, str] = {}
+        for partition_name, part_indices in (
+            ("train", result.train), ("val", result.val), ("test", result.test)
+        ):
+            for index in part_indices:
+                group = str(grupos[index])
+                previous = group_partition.setdefault(group, partition_name)
+                if previous != partition_name:
+                    raise RuntimeError(f"El grupo {group!r} quedó en más de una partición.")
+    return result
+
+
+def _stratified_split(indices, labels, test_size: float, seed: int):
+    try:
+        return train_test_split(
+            indices, test_size=test_size, random_state=seed, stratify=labels
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "No se puede crear una partición estratificada con estos datos. "
+            "Verificá que cada clase tenga suficientes grupos únicos para train, "
+            "validación y prueba. No se aplicará una división no estratificada automáticamente."
+        ) from exc
+
+
+def dataset_fingerprint(dataset) -> str:
+    """Fingerprint portable de fuente/ruta relativa/etiqueta/contenido."""
+    digest = hashlib.sha256()
+    for record in dataset.records:
+        line = f"KEEP\t{record.source}\t{record.relative_path}\t{record.label}\t{record.group_id}\n"
+        digest.update(line.encode("utf-8"))
+    for duplicate in getattr(dataset, "excluded_duplicates", []):
+        line = (
+            f"EXCLUDE_EXACT_DUPLICATE\t{duplicate.source}\t{duplicate.relative_path}\t"
+            f"{duplicate.kept_relative_path}\t{duplicate.label}\t{duplicate.group_id}\n"
+        )
+        digest.update(line.encode("utf-8"))
+    return digest.hexdigest()
+
+
+def guardar_split(
+    ruta: Path,
+    split: DatasetSplit,
+    dataset,
+    seed: int,
+    train_size: float,
+    val_size: float,
+    test_size: float,
+) -> None:
+    split.validate(len(dataset))
+    payload = {
+        "version": 2,
+        "seed": seed,
+        "train_size": train_size,
+        "val_size": val_size,
+        "test_size": test_size,
+        "dataset_size": len(dataset),
+        "dataset_fingerprint": dataset_fingerprint(dataset),
+        "class_names": list(dataset.clases),
+        "source_names": list(dataset.source_names),
+        "grouping": "sha256_image_content",
+        "deduplicate_exact_duplicates": getattr(dataset, "deduplicate_exact_duplicates", False),
+        "exact_duplicate_files_excluded": len(getattr(dataset, "excluded_duplicates", [])),
+        "indices": asdict(split),
+    }
+    save_json(payload, ruta)
+
+
+def cargar_split(
+    ruta: Path,
+    dataset,
+    expected_seed: int | None = None,
+    train_size: float | None = None,
+    val_size: float | None = None,
+    test_size: float | None = None,
+) -> DatasetSplit:
+    if not ruta.is_file():
+        raise FileNotFoundError(f"No se encontró el split guardado: {ruta}")
+    with ruta.open("r", encoding="utf-8") as file:
+        payload = json.load(file)
+    if payload.get("dataset_size") != len(dataset):
+        raise ValueError("El tamaño del dataset no coincide con el usado para crear el split.")
+    if payload.get("class_names") != list(dataset.clases):
+        raise ValueError("Las clases actuales no coinciden con las del split guardado.")
+    if expected_seed is not None and payload.get("seed") != expected_seed:
+        raise ValueError(
+            f"El split guardado usa semilla {payload.get('seed')}, pero la configuración solicita "
+            f"{expected_seed}. Usá --regenerar-splits para cambiar explícitamente las particiones."
+        )
+    for key, requested in (("train_size", train_size), ("val_size", val_size), ("test_size", test_size)):
+        if requested is not None and abs(float(payload.get(key, -1)) - requested) > 1e-6:
+            raise ValueError(
+                f"El split guardado tiene {key}={payload.get(key)}, pero se solicita {requested}. "
+                "Usá --regenerar-splits para cambiar explícitamente las particiones."
+            )
+    if payload.get("source_names", list(dataset.source_names)) != list(dataset.source_names):
+        raise ValueError("Las fuentes actuales no coinciden con las del split guardado.")
+    if payload.get("dataset_fingerprint") != dataset_fingerprint(dataset):
+        raise ValueError(
+            "El contenido o la estructura del dataset cambió. Regenerá explícitamente las particiones."
+        )
+    indices = payload.get("indices", {})
+    split = DatasetSplit(
+        train=list(indices.get("train", [])),
+        val=list(indices.get("val", [])),
+        test=list(indices.get("test", [])),
+    )
+    split.validate(len(dataset))
+    group_partition: dict[str, str] = {}
+    for partition_name in ("train", "val", "test"):
+        for index in getattr(split, partition_name):
+            group = dataset.records[index].group_id
+            previous = group_partition.setdefault(group, partition_name)
+            if previous != partition_name:
+                raise ValueError(
+                    "El split guardado separa copias exactas de una misma imagen entre "
+                    f"'{previous}' y '{partition_name}'. Regenerá las particiones."
+                )
+    return split
+
+
+
+========== src\core\experimentos\schemas.py ==========
+
+
+"""Modelos de datos para la definición y ejecución de experimentos."""
+from __future__ import annotations
+
+from copy import deepcopy
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Literal
+from uuid import uuid4
+
+DatasetRole = Literal[
+    "train_source",
+    "final_test",
+    "external_eval",
+    "unused",
+]
+
+RunStatus = Literal[
+    "pending",
+    "running",
+    "completed",
+    "failed",
+    "cancelled",
+]
+
+DATASET_ROLES = {
+    "train_source",
+    "final_test",
+    "external_eval",
+    "unused",
+}
+
+RUN_STATUSES = {
+    "pending",
+    "running",
+    "completed",
+    "failed",
+    "cancelled",
+}
+
+TERMINAL_RUN_STATUSES = {"completed", "failed", "cancelled"}
+
+
+def utc_now() -> str:
+    """Devuelve la fecha y hora actual en UTC, en formato ISO 8601."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _require_nonempty_string(value: Any, field_name: str) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} debe ser un texto no vacío.")
+
+
+@dataclass(frozen=True)
+class DatasetAssignment:
+    source_name: str
+    path: str
+    role: DatasetRole
+
+    def __post_init__(self) -> None:
+        _require_nonempty_string(self.source_name, "source_name")
+        _require_nonempty_string(self.path, "path")
+
+        if self.role not in DATASET_ROLES:
+            raise ValueError(f"Rol no válido: {self.role!r}.")
+
+    def to_dict(self) -> dict[str, str]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> DatasetAssignment:
+        if not isinstance(data, dict):
+            raise ValueError("La asignación del dataset debe ser un objeto.")
+        return cls(**data)
+
+
+@dataclass(frozen=True)
+class ExperimentSpec:
+    name: str
+    model_name: str
+    datasets: tuple[DatasetAssignment, ...]
+    parameters: dict[str, Any] = field(default_factory=dict)
+    description: str = ""
+    class_file: str | None = None
+    experiment_id: str = field(default_factory=lambda: uuid4().hex)
+
+    def __post_init__(self) -> None:
+        _require_nonempty_string(self.name, "name")
+        _require_nonempty_string(self.model_name, "model_name")
+        _require_nonempty_string(self.experiment_id, "experiment_id")
+
+        if not isinstance(self.description, str):
+            raise ValueError("description debe ser un texto.")
+
+        if not isinstance(self.datasets, tuple) or not self.datasets:
+            raise ValueError("Debe declararse al menos una fuente de datos.")
+
+        if not all(isinstance(d, DatasetAssignment) for d in self.datasets):
+            raise ValueError(
+                "datasets debe contener objetos DatasetAssignment."
+            )
+
+        names = [d.source_name.casefold() for d in self.datasets]
+        if len(names) != len(set(names)):
+            raise ValueError(
+                "No se puede asignar más de un rol a la misma fuente."
+            )
+
+        if not any(d.role == "train_source" for d in self.datasets):
+            raise ValueError(
+                "Debe existir al menos una fuente con rol 'train_source'."
+            )
+
+        if not isinstance(self.parameters, dict):
+            raise ValueError("parameters debe ser un diccionario.")
+
+        # Evita compartir accidentalmente diccionarios anidados con el llamador.
+        object.__setattr__(self, "parameters", deepcopy(self.parameters))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "experiment_id": self.experiment_id,
+            "name": self.name,
+            "model_name": self.model_name,
+            "datasets": [d.to_dict() for d in self.datasets],
+            "parameters": deepcopy(self.parameters),
+            "description": self.description,
+            "class_file": self.class_file,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ExperimentSpec:
+        if not isinstance(data, dict):
+            raise ValueError("El experimento debe ser un objeto.")
+
+        return cls(
+            experiment_id=data.get("experiment_id", uuid4().hex),
+            name=data["name"],
+            model_name=data["model_name"],
+            datasets=tuple(
+                DatasetAssignment.from_dict(d) for d in data["datasets"]
+            ),
+            parameters=data.get("parameters", {}),
+            description=data.get("description", ""),
+            class_file=data.get("class_file"),
+        )
+
+
+@dataclass(frozen=True)
+class RunRecord:
+    run_id: str
+    experiment_id: str
+    status: RunStatus
+    checkpoint_path: str | None = None
+    error_message: str | None = None
+    created_at: str = field(default_factory=utc_now)
+    finished_at: str | None = None
+
+    def __post_init__(self) -> None:
+        _require_nonempty_string(self.run_id, "run_id")
+        _require_nonempty_string(self.experiment_id, "experiment_id")
+
+        if self.status not in RUN_STATUSES:
+            raise ValueError(f"Estado no válido: {self.status!r}.")
+
+        if self.checkpoint_path is not None:
+            _require_nonempty_string(self.checkpoint_path, "checkpoint_path")
+
+        if self.error_message is not None and not isinstance(
+            self.error_message, str
+        ):
+            raise ValueError("error_message debe ser un texto o None.")
+
+        for field_name in ("created_at", "finished_at"):
+            value = getattr(self, field_name)
+            if value is None and field_name == "finished_at":
+                continue
+            _require_nonempty_string(value, field_name)
+            try:
+                datetime.fromisoformat(value)
+            except ValueError as exc:
+                raise ValueError(
+                    f"{field_name} debe tener formato ISO 8601."
+                ) from exc
+
+        is_terminal = self.status in TERMINAL_RUN_STATUSES
+        if is_terminal and self.finished_at is None:
+            raise ValueError(
+                "Una ejecución finalizada debe tener finished_at."
+            )
+        if not is_terminal and self.finished_at is not None:
+            raise ValueError(
+                "Una ejecución no finalizada no debe tener finished_at."
+            )
+
+        if self.status == "completed" and not self.checkpoint_path:
+            raise ValueError(
+                "Una ejecución completada debe indicar su checkpoint."
+            )
+
+        if self.status == "failed" and not self.error_message:
+            raise ValueError(
+                "Una ejecución fallida debe indicar el error."
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> RunRecord:
+        if not isinstance(data, dict):
+            raise ValueError("La ejecución debe ser un objeto.")
+        return cls(**data)
+
+
+
+========== src\core\experimentos\service.py ==========
+
+
+from __future__ import annotations
+
+from dataclasses import fields
+from pathlib import Path
+from threading import Event
+from typing import Any
+from src.core.utils.io import load_json, save_json
+from torch.utils.data import ConcatDataset, DataLoader
+
+import time
+import uuid
+import torch
+import random
+import platform
+import numpy as np
+
+
+
+
+from src.core.configuracion.settings import (
+    ExperimentConfig,
+    build_experiment_config,
+    cargar_clases,
+    get_model_spec,
+)
+from src.core.dataset.experiment import (
+    prepare_sources,
+    subset_for,
+)
+from src.core.configuracion.discovery import (
+    get_dataset_catalog,
+    inspect_dataset_directory,
+)
+from src.core.dataset.split import dataset_fingerprint
+from src.core.dataset.transforms import (
+    build_eval_transform,
+    build_train_transform,
+)
+from src.core.entrenamiento.trainer import Trainer, TrainingCancelled
+from src.core.experimentos.registry import ExperimentRegistry
+from src.core.experimentos.schemas import (
+    DATASET_ROLES,
+    ExperimentSpec,
+    RunRecord,
+)
+from src.core.modelos.factory import (
+    adaptar_normalizacion_a_modelo,
+    congelar_backbone,
+    crear_modelo,
+    descongelar_modelo,
+)
+from src.core.utils.io import save_json
+from src.core.utils.paths import ProjectPaths
+from src.core.utils.reproducibilidad import establecer_semilla
+
+
+class ExperimentService:
+    """Coordina experimentos sin duplicar el pipeline de entrenamiento."""
+
+    def __init__(
+        self,
+        root: str | Path,
+        registry: ExperimentRegistry | None = None,
+    ) -> None:
+        self.paths = ProjectPaths(Path(root).expanduser().resolve())
+        self.registry = registry or ExperimentRegistry(
+            self.paths.results_dir / "registry"
+        )
+
+    @staticmethod
+    def _model_id_prefix(model_name: str) -> str:
+        prefixes = {
+            "mobilenetv2": "MNET",
+            "densenet201": "DENS",
+            "vit_tiny": "VITT",
+            "vit_base": "VITB",
+        }
+        return prefixes.get(model_name.casefold(), model_name[:4].upper())
+
+    def next_experiment_id(self, model_name: str) -> str:
+        """Genera una ID legible y correlativa por familia de modelo."""
+        prefix = self._model_id_prefix(model_name)
+        highest = 0
+        for experiment_id in self.registry.list_experiments():
+            if experiment_id.startswith(prefix + "-"):
+                suffix = experiment_id[len(prefix) + 1:]
+                if suffix.isdigit():
+                    highest = max(highest, int(suffix))
+        return f"{prefix}-{highest + 1:03d}"
+
+    def create_experiment(self, spec: ExperimentSpec) -> ExperimentSpec:
+        """Valida y persiste una definición nueva e inmutable por ID."""
+        self.validate_experiment(spec)
+        if spec.experiment_id in self.registry.list_experiments():
+            raise FileExistsError(
+                f"Ya existe el experimento {spec.experiment_id!r}; "
+                "creá otro experimento para guardar una configuración distinta."
+            )
+        self.registry.save_experiment(spec)
+        return spec
+
+    def get_experiment(self, experiment_id: str) -> ExperimentSpec:
+        return self.registry.load_experiment(experiment_id)
+
+    def delete_experiment(self, experiment_id: str) -> None:
+        """Elimina la definición solo si no tiene ejecuciones asociadas."""
+        self.registry.delete_experiment(experiment_id)
+
+    def list_experiments(self) -> list[str]:
+        return self.registry.list_experiments()
+
+    def create_run(self, experiment_id: str, run_id: str | None = None) -> RunRecord:
+        """Registra una ejecución pendiente sin iniciar todavía el entrenamiento."""
+        spec = self.get_experiment(experiment_id)
+        if run_id is None:
+            prefix = f"{spec.experiment_id}-R"
+            highest = 0
+            for existing in self.registry.list_runs(spec.experiment_id):
+                if existing.run_id.startswith(prefix):
+                    suffix = existing.run_id[len(prefix):]
+                    if suffix.isdigit():
+                        highest = max(highest, int(suffix))
+            run_id = f"{prefix}{highest + 1:02d}"
+        run = RunRecord(
+            run_id=run_id,
+            experiment_id=spec.experiment_id,
+            status="pending",
+        )
+        self.registry.save_run(run)
+        return run
+
+    def get_run(self, run_id: str) -> RunRecord:
+        return self.registry.load_run(run_id)
+
+    def list_runs(self, experiment_id: str | None = None) -> list[RunRecord]:
+        return self.registry.list_runs(experiment_id)
+
+    def validate_experiment(self, spec: ExperimentSpec) -> None:
+        if not isinstance(spec, ExperimentSpec):
+            raise TypeError("spec debe ser una instancia de ExperimentSpec.")
+
+        get_model_spec(spec.model_name)
+
+        catalog = get_dataset_catalog(self.paths.root)
+        available_sources = {
+            source["name"]: source for source in catalog["sources"]
+        }
+        invalid_catalog_sources = {
+            source["name"]: source for source in catalog["invalid_sources"]
+        }
+
+        unknown_sources = sorted(
+            {
+                dataset.source_name
+                for dataset in spec.datasets
+                if dataset.source_name not in available_sources
+                and dataset.source_name not in invalid_catalog_sources
+            }
+        )
+        if unknown_sources:
+            raise ValueError(
+                "Fuentes no detectadas en data/ o no configuradas: "
+                + ", ".join(unknown_sources)
+            )
+
+        rejected_sources = sorted(
+            name for name in {
+                dataset.source_name for dataset in spec.datasets
+            } if name in invalid_catalog_sources
+        )
+        if rejected_sources:
+            details = "; ".join(
+                f"{name}: {invalid_catalog_sources[name]['reason']}"
+                for name in rejected_sources
+            )
+            raise ValueError("Hay fuentes con estructura no válida: " + details)
+
+        invalid_roles = sorted(
+            {
+                dataset.role
+                for dataset in spec.datasets
+                if dataset.role not in DATASET_ROLES
+            }
+        )
+        if invalid_roles:
+            raise ValueError(
+                "Roles de dataset no válidos: " + ", ".join(invalid_roles)
+            )
+
+        config = self._build_config(spec)
+
+        for dataset in spec.datasets:
+            if dataset.role == "unused":
+                continue
+            path = Path(dataset.path).expanduser()
+            if not path.is_absolute():
+                path = self.paths.root / path
+            inspect_dataset_directory(path, expected_class_names=config.class_names)
+
+    def _build_config(self, spec: ExperimentSpec) -> ExperimentConfig:
+        allowed = {
+            item.name
+            for item in fields(ExperimentConfig)
+        }
+
+        forbidden = {"model", "class_names"} & set(spec.parameters)
+        if forbidden:
+            raise ValueError(
+                "Estos parámetros no se pueden sobrescribir directamente: "
+                + ", ".join(sorted(forbidden))
+            )
+
+        unknown = set(spec.parameters) - allowed
+        if unknown:
+            raise ValueError(
+                "Parámetros de configuración desconocidos: "
+                + ", ".join(sorted(unknown))
+            )
+
+        return build_experiment_config(
+            spec.model_name,
+            class_names=self._resolve_class_names(spec),
+            **spec.parameters,
+        )
+
+    def _resolve_class_names(
+        self,
+        spec: ExperimentSpec,
+    ) -> tuple[str, ...]:
+        if spec.class_file is None:
+            return cargar_clases()
+
+        path = Path(spec.class_file).expanduser()
+
+        if not path.is_absolute():
+            path = self.paths.root / path
+
+        return cargar_clases(path)
+
+
+    @staticmethod
+    def _resolve_device(device_config: str) -> torch.device:
+        """Resuelve el dispositivo respetando la configuración del experimento."""
+        if device_config == "auto":
+            return torch.device(
+                "cuda" if torch.cuda.is_available() else "cpu"
+            )
+
+        if device_config == "cpu":
+            return torch.device("cpu")
+
+        if device_config == "cuda":
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    "Se solicitó el dispositivo 'cuda', "
+                    "pero CUDA no está disponible."
+                )
+            return torch.device("cuda")
+
+        raise ValueError(
+            f"Dispositivo no válido: {device_config!r}. "
+            "Opciones permitidas: 'auto', 'cpu' o 'cuda'."
+        )
+
+
+    @staticmethod
+    def _make_loader(
+        dataset,
+        config: ExperimentConfig,
+        device: torch.device,
+        *,
+        shuffle: bool,
+        seed: int,
+    ) -> DataLoader:
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+
+        def seed_worker(worker_id: int) -> None:
+            worker_seed = torch.initial_seed() % (2**32)
+            random.seed(worker_seed)
+            np.random.seed(worker_seed)
+
+        return DataLoader(
+            dataset,
+            batch_size=config.batch_size,
+            shuffle=shuffle,
+            num_workers=config.num_workers,
+            pin_memory=config.pin_memory and device.type == "cuda",
+            generator=generator,
+            worker_init_fn=seed_worker if config.num_workers > 0 else None,
+            persistent_workers=config.num_workers > 0,
+        )
+
+    def run_experiment(
+        self,
+        experiment_id: str,
+        run_id: str | None = None,
+        cancel_event: Event | None = None,
+    ) -> RunRecord:
+        """Ejecuta el entrenamiento y persiste el estado de la ejecución."""
+        spec = self.get_experiment(experiment_id)
+        self.validate_experiment(spec)
+
+        run_id = run_id or uuid.uuid4().hex
+        try:
+            try:
+                run = self.registry.load_run(run_id)
+            except FileNotFoundError:
+                run = self.create_run(spec.experiment_id, run_id=run_id)
+
+            if run.experiment_id != spec.experiment_id:
+                raise ValueError("La ejecución no pertenece al experimento indicado.")
+            if run.status != "pending":
+                raise ValueError(
+                    f"La ejecución {run_id!r} no está pendiente: {run.status!r}."
+                )
+            self.registry.update_run_status(run_id, "running")
+
+            config = self._build_config(spec)
+            device = self._resolve_device(config.device)
+
+            train_assignments = [
+                dataset
+                for dataset in spec.datasets
+                if dataset.role == "train_source"
+            ]
+            if not train_assignments:
+                raise ValueError(
+                    "Se necesita al menos una fuente con rol 'train_source'."
+                )
+
+            # Cada ejecución tiene directorios propios: nunca sobrescribe
+            # checkpoints ni resultados de otra ejecución.
+            artifact_root = (
+                self.paths.results_dir
+                / "experiments"
+                / spec.experiment_id
+                / run_id
+            )
+            checkpoint_dir = (
+                self.paths.checkpoints_dir
+                / "experiments"
+                / spec.experiment_id
+                / run_id
+            )
+            artifact_root.mkdir(parents=True, exist_ok=False)
+            checkpoint_dir.mkdir(parents=True, exist_ok=False)
+
+            checkpoint_path = checkpoint_dir / "mejor.pth"
+            history_path = artifact_root / "history.json"
+
+            establecer_semilla(config.seed)
+
+            active_assignments = [
+                item for item in spec.datasets if item.role != "unused"
+            ]
+            path_overrides = {
+                item.source_name: item.path for item in active_assignments
+            }
+            active_source_names = [
+                item.source_name for item in active_assignments
+            ]
+            source_names = [item.source_name for item in train_assignments]
+
+            # Se preparan también las fuentes reservadas para evaluación. Sus
+            # particiones train/val nunca se incorporan al entrenamiento.
+            prepared = prepare_sources(
+                self.paths,
+                config,
+                requested_sources=active_source_names,
+                path_overrides=path_overrides,
+                create_missing_splits=True,
+                source_assignments=active_assignments,
+            )
+
+
+            model_spec = get_model_spec(spec.model_name)
+
+            model = crear_modelo(
+                arquitectura=config.model.architecture,
+                num_classes=config.num_classes,
+                pretrained=config.model.pretrained,
+                dispositivo=device,
+            )
+
+            config = adaptar_normalizacion_a_modelo(config, model)
+
+            train_transform = build_train_transform(config=config)
+            eval_transform = build_eval_transform(config=config)
+
+            train_parts = [
+                subset_for(prepared[name], "train", train_transform)
+                for name in source_names
+            ]
+            val_parts = [
+                subset_for(prepared[name], "val", eval_transform)
+                for name in source_names
+            ]
+
+            train_dataset = (
+                train_parts[0]
+                if len(train_parts) == 1
+                else ConcatDataset(train_parts)
+            )
+            val_dataset = (
+                val_parts[0]
+                if len(val_parts) == 1
+                else ConcatDataset(val_parts)
+            )
+
+            train_loader = self._make_loader(
+                train_dataset, config, device,
+                shuffle=True, seed=config.seed,
+            )
+            val_loader = self._make_loader(
+                val_dataset, config, device,
+                shuffle=False, seed=config.seed,
+            )
+
+            model = (
+                congelar_backbone(model)
+                if config.freeze_backbone
+                else descongelar_modelo(model)
+            )
+
+            metadata: dict[str, Any] = {
+                "experiment_id": spec.experiment_id,
+                "run_id": run_id,
+                "model_name": spec.model_name,
+                "training_sources": source_names,
+                "dataset_roles": {item.source_name: item.role for item in active_assignments},
+                "source_paths": {
+                    item.source_name: self.paths.relative_to_root(
+                        (
+                            Path(item.path).expanduser()
+                            if Path(item.path).expanduser().is_absolute()
+                            else self.paths.root / Path(item.path).expanduser()
+                        ).resolve()
+                    )
+                    for item in active_assignments
+                },
+
+                "split_paths": {
+                    name: self.paths.relative_to_root(prepared[name].split_path)
+                    for name in source_names
+                },
+                
+                "fingerprints": {
+                    name: dataset_fingerprint(prepared[name].dataset)
+                    for name in active_source_names
+                },
+                "device": str(device),
+                "torch_version": str(torch.__version__),
+                "device": str(device),
+                "torch_version": str(torch.__version__),
+                "python_version": platform.python_version(),
+                "gpu_name": (
+                    torch.cuda.get_device_name(device)
+                    if device.type == "cuda"
+                    else None
+                ),
+                "cuda_version": torch.version.cuda,
+            }
+
+            config_payload = config.to_dict()
+            config_payload.update({
+                "experiment_id": spec.experiment_id,
+                "run_id": run_id,
+                "experiment_name": spec.name,
+                "description": spec.description,
+                "dataset_assignments": [
+                    item.to_dict() for item in spec.datasets
+                ],
+                "metadata": metadata,
+            })
+            save_json(config_payload, artifact_root / "config.json")
+
+            trainer = Trainer(
+                model=model,
+                train_loader=train_loader,
+                val_loader=val_loader,
+                config=config,
+                checkpoint_path=checkpoint_path,
+                history_path=history_path,
+                metadata=metadata,
+                cancel_event=cancel_event,
+            )
+
+
+            # Medición de recursos del entrenamiento.
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+                torch.cuda.reset_peak_memory_stats(device)
+
+            training_started = time.perf_counter()
+            trainer.fit()
+
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+
+            training_seconds = time.perf_counter() - training_started
+
+            # No registrar métricas de éxito si se solicitó cancelar.
+            if cancel_event is not None and cancel_event.is_set():
+                raise TrainingCancelled(
+                    "El usuario solicitó detener el entrenamiento."
+                )
+
+            # Memoria RAM máxima del proceso según el sistema operativo.
+            try:
+                import resource
+
+                max_rss_raw = resource.getrusage(
+                    resource.RUSAGE_SELF
+                ).ru_maxrss
+
+                # Linux informa KiB; macOS informa bytes.
+                max_rss_mb = max_rss_raw / (
+                    1024 if platform.system() == "Linux"
+                    else 1024 * 1024
+                )
+            except (ImportError, AttributeError, OSError):
+                max_rss_mb = None
+
+            try:
+                checkpoint_mb = (
+                    checkpoint_path.stat().st_size / (1024 * 1024)
+                )
+            except OSError:
+                checkpoint_mb = None
+
+            epoch_history = (
+                load_json(history_path)
+                if history_path.is_file()
+                else []
+            )
+
+            trainable_parameters = sum(
+                p.numel()
+                for p in model.parameters()
+                if p.requires_grad
+            )
+            total_parameters = sum(
+                p.numel() for p in model.parameters()
+            )
+
+            resource_metrics = {
+                "experiment_id": spec.experiment_id,
+                "run_id": run_id,
+                "model": spec.model_name,
+                "device": str(device),
+                "gpu_name": (
+                    torch.cuda.get_device_name(device)
+                    if device.type == "cuda"
+                    else None
+                ),
+                "python_version": platform.python_version(),
+                "pytorch_version": str(torch.__version__),
+                "cuda_available": torch.cuda.is_available(),
+                "image_size": config.image_size,
+                "batch_size": config.batch_size,
+                "epochs_completed": len(epoch_history),
+                "training_time_seconds": round(training_seconds, 4),
+                "mean_epoch_time_seconds": (
+                    round(
+                        sum(
+                            row.get("epoch_seconds", 0.0)
+                            for row in epoch_history
+                        ) / len(epoch_history),
+                        4,
+                    )
+                    if epoch_history
+                    else None
+                ),
+                "max_process_ram_mb": (
+                    round(max_rss_mb, 2)
+                    if max_rss_mb is not None
+                    else None
+                ),
+                "gpu_peak_allocated_mb": (
+                    round(
+                        torch.cuda.max_memory_allocated(device)
+                        / (1024 * 1024),
+                        2,
+                    )
+                    if device.type == "cuda"
+                    else None
+                ),
+                "gpu_peak_reserved_mb": (
+                    round(
+                        torch.cuda.max_memory_reserved(device)
+                        / (1024 * 1024),
+                        2,
+                    )
+                    if device.type == "cuda"
+                    else None
+                ),
+                "parameters_total": total_parameters,
+                "parameters_trainable": trainable_parameters,
+                "checkpoint_size_mb": (
+                    round(checkpoint_mb, 3)
+                    if checkpoint_mb is not None
+                    else None
+                ),
+                "note_ram": (
+                    "Máximo RSS del proceso según el sistema operativo; "
+                    "no equivale a memoria exclusiva del modelo."
+                ),
+                "note_gpu_memory": (
+                    "Pico de memoria gestionada por el asignador de PyTorch; "
+                    "no incluye necesariamente todas las asignaciones "
+                    "externas a PyTorch."
+                ),
+            }
+
+            save_json(
+                resource_metrics,
+                artifact_root / "metricas_recursos_entrenamiento.json",
+            )
+
+            if not checkpoint_path.is_file():
+                raise RuntimeError(
+                    "El entrenamiento terminó sin generar el checkpoint esperado."
+                )
+
+            return self.registry.update_run_status(
+                run_id,
+                "completed",
+                checkpoint_path=self.paths.relative_to_root(checkpoint_path),
+            )
+
+        except TrainingCancelled as exc:
+            try:
+                current = self.registry.load_run(run_id)
+                if current.experiment_id == spec.experiment_id and current.status in {"pending", "running"}:
+                    return self.registry.update_run_status(
+                        run_id,
+                        "cancelled",
+                        error_message=str(exc),
+                    )
+            except Exception:
+                raise
+            return self.registry.load_run(run_id)
+        except Exception as exc:
+            try:
+                current = self.registry.load_run(run_id)
+                if (
+                    current.experiment_id == spec.experiment_id
+                    and current.status in {"pending", "running"}
+                ):
+                    self.registry.update_run_status(
+                        run_id,
+                        "failed",
+                        error_message=f"{type(exc).__name__}: {exc}",
+                    )
+            except Exception as status_exc:
+                # No reemplazar el error original por un fallo de registro.
+                import logging
+
+                logging.getLogger(__name__).error(
+                    "No se pudo registrar el fallo de la ejecución %s: %s: %s",
+                    run_id,
+                    type(status_exc).__name__,
+                    status_exc,
+                )
+            raise
+
+
+
+========== src\core\experimentos\registry.py ==========
+
+
+"""Persistencia local de experimentos y ejecuciones."""
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+from dataclasses import replace
+from pathlib import Path
+from typing import Any
+
+from src.core.experimentos.schemas import (
+    ExperimentSpec,
+    RunRecord,
+    RUN_STATUSES,
+    TERMINAL_RUN_STATUSES,
+    utc_now,
+)
+
+
+class ExperimentRegistry:
+    """Almacena definiciones de experimentos y sus ejecuciones."""
+
+    _TRANSITIONS = {
+        "pending": {"running", "failed", "cancelled"},
+        "running": {"completed", "failed", "cancelled"},
+        "completed": set(),
+        "failed": set(),
+        "cancelled": set(),
+    }
+
+    def __init__(self, root: str | Path) -> None:
+        self.root = Path(root)
+        self.experiments_dir = self.root / "experiments"
+        self.runs_dir = self.root / "runs"
+
+        self.experiments_dir.mkdir(parents=True, exist_ok=True)
+        self.runs_dir.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _validate_id(value: str, field: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{field} no puede estar vacío.")
+        if value in {".", ".."} or Path(value).name != value:
+            raise ValueError(f"{field} no es válido: {value!r}.")
+        if any(char in value for char in ("/", "\\", "\0")):
+            raise ValueError(f"{field} no es válido: {value!r}.")
+        return value
+
+    @staticmethod
+    def _write_json(path: Path, data: dict[str, Any]) -> None:
+        """Reemplaza el JSON de forma atómica."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=path.parent,
+        )
+        temporary_path = Path(temporary_name)
+
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as file:
+                json.dump(
+                    data,
+                    file,
+                    ensure_ascii=False,
+                    indent=2,
+                    allow_nan=False,
+                )
+                file.write("\n")
+                file.flush()
+                os.fsync(file.fileno())
+
+            os.replace(temporary_path, path)
+        except BaseException:
+            temporary_path.unlink(missing_ok=True)
+            raise
+
+    @staticmethod
+    def _read_json(path: Path) -> dict[str, Any]:
+        try:
+            with path.open("r", encoding="utf-8") as file:
+                data = json.load(file)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"El archivo JSON está corrupto: {path}"
+            ) from exc
+
+        if not isinstance(data, dict):
+            raise ValueError(f"Se esperaba un objeto JSON en {path}.")
+        return data
+
+    def save_experiment(self, experiment: ExperimentSpec) -> None:
+        if not isinstance(experiment, ExperimentSpec):
+            raise TypeError(
+                "experiment debe ser una instancia de ExperimentSpec."
+            )
+
+        experiment_id = self._validate_id(
+            experiment.experiment_id,
+            "experiment_id",
+        )
+        path = self.experiments_dir / f"{experiment_id}.json"
+
+        # Si existe, solo se permite actualizar la misma definición por ID.
+        if path.exists():
+            stored = ExperimentSpec.from_dict(self._read_json(path))
+            if stored.experiment_id != experiment.experiment_id:
+                raise ValueError("El ID del experimento no coincide.")
+
+        self._write_json(path, experiment.to_dict())
+
+    def load_experiment(self, experiment_id: str) -> ExperimentSpec:
+        experiment_id = self._validate_id(experiment_id, "experiment_id")
+        path = self.experiments_dir / f"{experiment_id}.json"
+
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"No existe el experimento {experiment_id!r}."
+            )
+
+        experiment = ExperimentSpec.from_dict(self._read_json(path))
+        if experiment.experiment_id != experiment_id:
+            raise ValueError(
+                f"El ID del archivo no coincide con el experimento: {path}"
+            )
+        return experiment
+
+    def list_experiments(self) -> list[str]:
+        return sorted(
+            path.stem for path in self.experiments_dir.glob("*.json")
+        )
+
+    def delete_experiment(self, experiment_id: str) -> None:
+        experiment_id = self._validate_id(experiment_id, "experiment_id")
+        path = self.experiments_dir / f"{experiment_id}.json"
+
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"No existe el experimento {experiment_id!r}."
+            )
+
+        if self.list_runs(experiment_id):
+            raise ValueError(
+                "No se puede eliminar un experimento con ejecuciones "
+                "asociadas. Conservá el historial."
+            )
+
+        path.unlink()
+
+    def save_run(self, run: RunRecord) -> None:
+        """Crea una ejecución nueva; no permite sobrescribir su historial."""
+        if not isinstance(run, RunRecord):
+            raise TypeError("run debe ser una instancia de RunRecord.")
+
+        run_id = self._validate_id(run.run_id, "run_id")
+        experiment_id = self._validate_id(
+            run.experiment_id,
+            "experiment_id",
+        )
+
+        # Comprueba existencia y validez de la definición asociada.
+        self.load_experiment(experiment_id)
+
+        path = self.runs_dir / f"{run_id}.json"
+        if path.exists():
+            raise FileExistsError(
+                f"La ejecución {run_id!r} ya existe."
+            )
+
+        self._write_json(path, run.to_dict())
+
+    def load_run(self, run_id: str) -> RunRecord:
+        run_id = self._validate_id(run_id, "run_id")
+        path = self.runs_dir / f"{run_id}.json"
+
+        if not path.is_file():
+            raise FileNotFoundError(f"No existe la ejecución {run_id!r}.")
+
+        run = RunRecord.from_dict(self._read_json(path))
+        if run.run_id != run_id:
+            raise ValueError(
+                f"El ID del archivo no coincide con la ejecución: {path}"
+            )
+        return run
+
+    def update_run_status(
+        self,
+        run_id: str,
+        status: str,
+        *,
+        checkpoint_path: str | None = None,
+        error_message: str | None = None,
+    ) -> RunRecord:
+        """Actualiza una ejecución validando la transición de estado."""
+        if status not in RUN_STATUSES:
+            raise ValueError(f"Estado no válido: {status!r}.")
+
+        current = self.load_run(run_id)
+
+        if current.status in TERMINAL_RUN_STATUSES:
+            raise ValueError(
+                f"La ejecución ya finalizó con estado {current.status!r}."
+            )
+
+        allowed = self._TRANSITIONS[current.status]
+        if status not in allowed:
+            raise ValueError(
+                f"Transición no permitida: {current.status!r} -> {status!r}."
+            )
+
+        changes: dict[str, Any] = {"status": status}
+
+        if status == "completed":
+            changes["checkpoint_path"] = checkpoint_path
+            changes["error_message"] = None
+
+        elif status == "failed":
+            changes["checkpoint_path"] = None
+            changes["error_message"] = error_message
+
+        elif status == "cancelled":
+            changes["checkpoint_path"] = None
+            changes["error_message"] = None
+
+        if status in TERMINAL_RUN_STATUSES:
+            changes["finished_at"] = utc_now()
+
+        updated = replace(current, **changes)
+
+        self._write_json(
+            self.runs_dir / f"{updated.run_id}.json",
+            updated.to_dict(),
+        )
+        return updated
+
+    def list_runs(
+        self,
+        experiment_id: str | None = None,
+    ) -> list[RunRecord]:
+        """Lista ejecuciones, opcionalmente filtradas por experimento."""
+        if experiment_id is not None:
+            experiment_id = self._validate_id(
+                experiment_id,
+                "experiment_id",
+            )
+
+        runs: list[RunRecord] = []
+        for path in sorted(self.runs_dir.glob("*.json")):
+
+            run = RunRecord.from_dict(self._read_json(path))
+
+            if run.run_id != path.stem:
+                raise ValueError(
+                    f"El ID del archivo no coincide con la ejecución: {path}"
+            )
+
+            if experiment_id is None or run.experiment_id == experiment_id:
+                runs.append(run)
+
+        return runs
+
+
+
+========== src\core\entrenamiento\trainer.py ==========
+
+from __future__ import annotations
+
+from pathlib import Path
+from threading import Event
+import time
+
+import torch
+
+from src.core.configuracion.settings import ExperimentConfig
+from src.core.modelos.factory import crear_modelo, congelar_backbone, descongelar_modelo
+from src.core.utils.io import save_json
+
+
+class TrainingCancelled(Exception):
+    """Señala una cancelación solicitada desde la API."""
+
+
+class Trainer:
+    """Ciclo de entrenamiento/validación con early stopping y checkpoints portables."""
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        train_loader,
+        val_loader,
+        config: ExperimentConfig,
+        checkpoint_path: Path,
+        history_path: Path,
+        metadata: dict | None = None,
+        cancel_event: Event | None = None,
+    ) -> None:
+        self.model = model
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.config = config
+        self.checkpoint_path = Path(checkpoint_path)
+        self.history_path = Path(history_path)
+        try:
+            self.device = next(model.parameters()).device
+        except StopIteration as exc:
+            raise ValueError("El modelo no tiene parámetros.") from exc
+
+        classifier = (
+            model.get_classifier()
+            if hasattr(model, "get_classifier")
+            else None
+        )
+
+        if config.freeze_backbone:
+            if classifier is None:
+                raise ValueError(
+                    "El modelo no expone un clasificador para validar "
+                    "el congelamiento del backbone."
+                )
+
+            classifier_parameter_ids = {
+                id(parameter)
+                for parameter in classifier.parameters()
+            }
+
+            if not classifier_parameter_ids:
+                raise ValueError(
+                    "El clasificador no tiene parámetros."
+                )
+
+            for name, parameter in model.named_parameters():
+                if id(parameter) in classifier_parameter_ids:
+                    if not parameter.requires_grad:
+                        raise ValueError(
+                            f"El parámetro del clasificador '{name}' "
+                            "debería estar entrenable."
+                        )
+                elif parameter.requires_grad:
+                    raise ValueError(
+                        f"El parámetro del backbone '{name}' "
+                        "debería estar congelado."
+                    )
+
+        elif not all(
+            parameter.requires_grad
+            for parameter in model.parameters()
+        ):
+            raise ValueError(
+                "freeze_backbone=False, pero existen parámetros congelados."
+            )
+
+        self.criterion = torch.nn.CrossEntropyLoss()
+        trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+        if not trainable_parameters:
+            raise ValueError("El modelo no tiene parámetros entrenables.")
+        self.optimizer = torch.optim.AdamW(
+            trainable_parameters,
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay,
+        )
+        self.metadata = metadata or {}
+        self.cancel_event = cancel_event or Event()
+
+    def _raise_if_cancelled(self) -> None:
+        if self.cancel_event.is_set():
+            raise TrainingCancelled("El usuario solicitó detener el entrenamiento.")
+
+    def _run_epoch(self, loader, training: bool) -> tuple[float, float]:
+        if len(loader) == 0:
+            raise ValueError("El DataLoader de entrenamiento/validación está vacío.")
+        if training and self.config.freeze_backbone:
+            # Mantiene congeladas también las estadísticas de BatchNorm del backbone.
+            self.model.eval()
+            classifier = self.model.get_classifier() if hasattr(self.model, "get_classifier") else None
+            if hasattr(classifier, "train"):
+                classifier.train(True)
+        else:
+            self.model.train(training)
+        total_loss = 0.0
+        correct = 0
+        total = 0
+        context = torch.enable_grad() if training else torch.no_grad()
+        with context:
+            for images, labels in loader:
+                self._raise_if_cancelled()
+                images = images.to(self.device, non_blocking=True)
+                labels = labels.to(self.device, non_blocking=True)
+                if training:
+                    self.optimizer.zero_grad(set_to_none=True)
+                logits = self.model(images)
+                if logits.ndim != 2 or logits.shape[1] != self.config.num_classes:
+                    raise ValueError(
+                        f"La salida del modelo debe tener forma [lote, {self.config.num_classes}], "
+                        f"pero se obtuvo {tuple(logits.shape)}."
+                    )
+                loss = self.criterion(logits, labels)
+                if not torch.isfinite(loss):
+                    raise FloatingPointError(
+                        "La pérdida dejó de ser finita. Revisá los datos, la tasa de aprendizaje y las transformaciones."
+                    )
+                if training:
+                    loss.backward()
+                    self.optimizer.step()
+                batch_size = int(labels.size(0))
+                total_loss += float(loss.item()) * batch_size
+                correct += int((logits.argmax(dim=1) == labels).sum().item())
+                total += batch_size
+        return total_loss / total, correct / total
+
+    def train_epoch(self) -> tuple[float, float]:
+        return self._run_epoch(self.train_loader, training=True)
+
+    def validate_epoch(self) -> tuple[float, float]:
+        return self._run_epoch(self.val_loader, training=False)
+
+    def _save_checkpoint(self, epoch: int, val_loss: float, val_accuracy: float) -> None:
+        payload = {
+            "format_version": 3,
+            "epoch": epoch,
+            "val_loss": val_loss,
+            "val_accuracy": val_accuracy,
+            "model": self.config.model.name,
+            "architecture": self.config.model.architecture,
+            "num_classes": self.config.num_classes,
+            "class_names": list(self.config.class_names),
+            "class_to_idx": self.config.class_to_idx,
+            "experiment_config": self.config.to_dict(),
+            "metadata": self.metadata,
+            "model_state_dict": self.model.state_dict(),
+        }
+        self.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.checkpoint_path.with_suffix(self.checkpoint_path.suffix + ".tmp")
+        torch.save(payload, temporary)
+        temporary.replace(self.checkpoint_path)
+
+    def fit(self) -> list[dict]:
+        best_val_loss = float("inf")
+        epochs_without_improvement = 0
+        history: list[dict] = []
+
+        for epoch in range(1, self.config.epochs + 1):
+            self._raise_if_cancelled()
+            epoch_started = time.perf_counter()
+            train_loss, train_accuracy = self.train_epoch()
+            val_loss, val_accuracy = self.validate_epoch()
+            epoch_seconds = time.perf_counter() - epoch_started
+            record = {
+                "epoch": epoch,
+                "epoch_seconds": round(epoch_seconds, 6),
+                "train_loss": train_loss,
+                "train_accuracy": train_accuracy,
+                "val_loss": val_loss,
+                "val_accuracy": val_accuracy,
+            }
+            history.append(record)
+            save_json(history, self.history_path)
+            print(
+                f"Época {epoch}/{self.config.epochs} | "
+                f"Train loss={train_loss:.4f} acc={train_accuracy:.4f} | "
+                f"Val loss={val_loss:.4f} acc={val_accuracy:.4f}"
+            )
+
+            self._raise_if_cancelled()
+            if val_loss < best_val_loss - self.config.min_delta:
+                best_val_loss = val_loss
+                epochs_without_improvement = 0
+                self._save_checkpoint(epoch, val_loss, val_accuracy)
+                print("  ✓ Nuevo mejor checkpoint.")
+            else:
+                epochs_without_improvement += 1
+                print(f"  Sin mejora: {epochs_without_improvement}/{self.config.patience}")
+
+            if epochs_without_improvement >= self.config.patience:
+                print("  Early stopping activado.")
+                break
+        return history
+
+
+def entrenar(
+    config: ExperimentConfig,
+    train_loader,
+    val_loader,
+    checkpoint_path: Path,
+    history_path: Path,
+    metadata: dict | None = None,
+):
+    model = crear_modelo(
+        arquitectura=config.model.architecture,
+        num_classes=config.num_classes,
+        pretrained=config.model.pretrained,
+    )
+    model = congelar_backbone(model) if config.freeze_backbone else descongelar_modelo(model)
+
+    trainer = Trainer(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        config=config,
+        checkpoint_path=checkpoint_path,
+        history_path=history_path,
+        metadata=metadata,
+    )
+    return trainer.fit()
+
+
+
+========== frontend\src\App.jsx ==========
+
+
+import { useCallback, useEffect, useState } from "react";
+import "./App.css";
+
+const API = "/api";
+
+const DATASET_ROLES = [
+  { value: "train_source", label: "Entrenamiento" },
+  { value: "final_test", label: "Prueba final" },
+  { value: "external_eval", label: "Evaluación externa" },
+  { value: "unused", label: "No utilizar" },
+];
+
+const ROLE_LABELS = {
+  train_source: "Entrenamiento",
+  final_test: "Prueba final",
+  external_eval: "Evaluación externa",
+  unused: "No utilizar",
+};
+
+const RUN_STATUS_LABELS = {
+  pending: "Pendiente",
+  running: "En ejecución",
+  completed: "Completada",
+  failed: "Fallida",
+  cancelled: "Cancelada",
+};
+
+const ACTIVE_RUN_STATUSES = new Set(["pending", "running"]);
+
+function formatDate(value) {
+  if (!value) return "—";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString("es-AR");
+}
+
+async function request(path, options = {}) {
+  const response = await fetch(`${API}${path}`, {
+    ...options,
+    headers: {
+      ...(options.body ? { "Content-Type": "application/json" } : {}),
+      ...options.headers,
+    },
+  });
+
+  const text = await response.text();
+  let data = null;
+
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = text;
+    }
+  }
+
+  if (!response.ok) {
+    const detail =
+      typeof data?.detail === "string"
+        ? data.detail
+        : Array.isArray(data?.detail)
+          ? data.detail
+              .map((item) => item.msg ?? JSON.stringify(item))
+              .join("; ")
+          : `Error HTTP ${response.status}`;
+
+    throw new Error(`${detail} (HTTP ${response.status})`);
+  }
+
+  return data;
+}
+
+const INITIAL_FORM = {
+  name: "",
+  description: "",
+  model_name: "",
+  datasets: [],
+  device: "auto",
+  image_size: 224,
+  batch_size: 32,
+  epochs: 30,
+  learning_rate: 0.001,
+  weight_decay: 0.0001,
+  patience: 5,
+  seed: 42,
+  freeze_backbone: true,
+  train_percent: 70,
+  validation_percent: 15,
+  test_percent: 15,
+};
+
+function App() {
+  const [health, setHealth] = useState("checking");
+  const [experiments, setExperiments] = useState([]);
+  const [models, setModels] = useState([]);
+  const [sources, setSources] = useState([]);
+  const [invalidSources, setInvalidSources] = useState([]);
+  const [runs, setRuns] = useState([]);
+  const [runHistories, setRunHistories] = useState({});
+  const [runsError, setRunsError] = useState("");
+  const [runsLoading, setRunsLoading] = useState(false);
+  const [launchingId, setLaunchingId] = useState(null);
+  const [hoveredActiveRunId, setHoveredActiveRunId] = useState(null);
+  const [cancellingRunId, setCancellingRunId] = useState(null);
+  const [cancellationRequestedIds, setCancellationRequestedIds] = useState(() => new Set());
+  const [error, setError] = useState("");
+  const [formError, setFormError] = useState("");
+  const [success, setSuccess] = useState("");
+  const [showForm, setShowForm] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [deletingId, setDeletingId] = useState(null);
+  const [evaluatingRunId, setEvaluatingRunId] = useState(null);
+  const [selectedEvaluation, setSelectedEvaluation] = useState(null);
+  const [selectedTestKey, setSelectedTestKey] = useState("original");
+  const [evaluationError, setEvaluationError] = useState("");
+
+
+  const [form, setForm] = useState(INITIAL_FORM);
+
+  const loadRuns = useCallback(async () => {
+    try {
+      const data = await request("/runs");
+      const items = Array.isArray(data) ? data : data?.runs ?? [];
+      const ordered = [...items].sort(
+        (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
+      );
+
+      setRuns(ordered);
+      setRunsError("");
+
+      const activeRunIds = new Set(
+        ordered
+          .filter((run) => ACTIVE_RUN_STATUSES.has(run.status))
+          .map((run) => run.run_id),
+      );
+      setCancellationRequestedIds((current) => {
+        const stillPending = [...current].filter((id) => activeRunIds.has(id));
+        return new Set(stillPending);
+      });
+
+      // history.json se actualiza al terminar cada época. Si todavía no existe,
+      // la ejecución simplemente se muestra sin métricas de progreso.
+      const terminalRunsWithHistory = new Set(["completed", "failed", "cancelled"]);
+      const historyTargets = [
+        ...ordered.filter((run) => ACTIVE_RUN_STATUSES.has(run.status)),
+        ...ordered.filter((run) => terminalRunsWithHistory.has(run.status)).slice(0, 5),
+      ];
+
+      await Promise.all(
+        historyTargets.map(async (run) => {
+          try {
+            const historyData = await request(
+              `/runs/${encodeURIComponent(run.run_id)}/history`,
+            );
+            const history = Array.isArray(historyData)
+              ? historyData
+              : historyData?.history ?? [];
+            setRunHistories((current) => ({
+              ...current,
+              [run.run_id]: history,
+            }));
+          } catch {
+            // Es normal que aún no exista history.json antes de la primera época.
+          }
+        }),
+      );
+    } catch (err) {
+      setRunsError(err.message);
+    }
+  }, []);
+
+  const loadDashboard = useCallback(async () => {
+    setError("");
+
+    try {
+      const [healthData, experimentData, modelData, sourceData] =
+        await Promise.all([
+          request("/health"),
+          request("/experiments"),
+          request("/models"),
+          request("/sources"),
+        ]);
+
+      setHealth(healthData?.status === "ok" ? "online" : "error");
+
+      setExperiments(
+        Array.isArray(experimentData)
+          ? experimentData
+          : experimentData?.experiments ?? [],
+      );
+
+      setModels(
+        Array.isArray(modelData) ? modelData : modelData?.models ?? [],
+      );
+
+      setSources(
+        Array.isArray(sourceData)
+          ? sourceData
+          : sourceData?.sources ?? [],
+      );
+      setInvalidSources(
+        Array.isArray(sourceData?.invalid_sources)
+          ? sourceData.invalid_sources
+          : [],
+      );
+
+      await loadRuns();
+    } catch (err) {
+      setHealth("error");
+      setError(err.message);
+    }
+  }, [loadRuns]);
+
+  useEffect(() => {
+    loadDashboard();
+  }, [loadDashboard]);
+
+  const hasActiveRun = runs.some((run) => ACTIVE_RUN_STATUSES.has(run.status));
+
+  useEffect(() => {
+    if (!hasActiveRun) return undefined;
+
+    const intervalId = window.setInterval(() => {
+      loadRuns();
+    }, 5000);
+
+    return () => window.clearInterval(intervalId);
+  }, [hasActiveRun, loadRuns]);
+
+  function updateForm(event) {
+    const { name, value } = event.target;
+    setForm((current) => ({ ...current, [name]: value }));
+  }
+
+  function updateDatasetAssignment(index, field, value) {
+    setForm((current) => ({
+      ...current,
+      datasets: current.datasets.map((dataset, i) =>
+        i === index ? { ...dataset, [field]: value } : dataset
+      ),
+    }));
+  }
+
+  function addDatasetAssignment() {
+    const assigned = new Set(
+      form.datasets.map((dataset) => dataset.source_name)
+    );
+
+    const nextSource = sources.find(
+      (source) => !assigned.has(source.name)
+    );
+
+    if (!nextSource) {
+      setFormError("No hay más datasets disponibles para asignar.");
+      return;
+    }
+
+    setFormError("");
+
+    setForm((current) => ({
+      ...current,
+      datasets: [
+        ...current.datasets,
+        {
+          source_name: nextSource.name,
+          role: current.datasets.some(
+            (dataset) => dataset.role === "train_source"
+          )
+            ? "final_test"
+            : "train_source",
+        },
+      ],
+    }));
+  }
+
+  function removeDatasetAssignment(index) {
+    setForm((current) => ({
+      ...current,
+      datasets: current.datasets.filter((_, i) => i !== index),
+    }));
+  }
+
+  function openForm() {
+    setFormError("");
+    setSuccess("");
+
+    setForm({
+      ...INITIAL_FORM,
+      model_name: models[0]?.name ?? "",
+      datasets: sources[0]
+        ? [
+            {
+              source_name: sources[0].name,
+              role: "train_source",
+            },
+          ]
+        : [],
+    });
+
+    setShowForm(true);
+  }
+
+  async function createExperiment(event) {
+    event.preventDefault();
+    setFormError("");
+    setSuccess("");
+
+  if (!form.name.trim()) {
+    setFormError("Ingresá un nombre para el experimento.");
+    return;
+  }
+
+  if (!form.model_name) {
+    setFormError("Seleccioná un modelo.");
+    return;
+  }
+
+  if (form.datasets.length === 0) {
+    setFormError("Asigná al menos un dataset.");
+    return;
+  }
+
+  if (!form.datasets.some((dataset) => dataset.role === "train_source")) {
+    setFormError("Debe existir al menos un dataset de entrenamiento.");
+    return;
+  }
+
+  // Evitar que una misma fuente se asigne más de una vez.
+  const assignedNames = form.datasets.map(
+    (dataset) => dataset.source_name
+  );
+
+  if (new Set(assignedNames).size !== assignedNames.length) {
+    setFormError("No podés asignar la misma fuente más de una vez.");
+    return;
+  }
+
+  // Validar porcentajes.
+  const trainPercent = Number(form.train_percent);
+  const validationPercent = Number(form.validation_percent);
+  const testPercent = Number(form.test_percent);
+
+  const percentages = [
+    trainPercent,
+    validationPercent,
+    testPercent,
+  ];
+
+  if (
+    percentages.some(
+      (value) => !Number.isFinite(value) || value <= 0 || value > 100
+    )
+  ) {
+    setFormError("Cada porcentaje debe ser mayor que 0 y no superar 100.");
+    return;
+  }
+
+  const percentageTotal = percentages.reduce(
+    (total, value) => total + value,
+    0
+  );
+
+  if (Math.abs(percentageTotal - 100) > 0.0001) {
+    setFormError("Los porcentajes de entrenamiento, validación y test deben sumar 100%.");
+    return;
+  }
+
+  // Resolver las fuentes y sus rutas.
+  const datasetsPayload = [];
+
+  for (const assignment of form.datasets) {
+    const selectedSource = sources.find(
+      (source) => source.name === assignment.source_name
+    );
+
+    if (!selectedSource?.path) {
+      setFormError(
+        `La fuente ${assignment.source_name} no tiene una ruta válida.`
+      );
+      return;
+    }
+
+    datasetsPayload.push({
+      source_name: selectedSource.name,
+      path: selectedSource.path,
+      role: assignment.role,
+    });
+  }
+
+  const trainingAssignment = form.datasets.find(
+    (dataset) => dataset.role === "train_source"
+  );
+  const trainingSource = sources.find(
+    (source) => source.name === trainingAssignment?.source_name
+  );
+
+  if (!trainingSource) {
+    setFormError("No se pudo resolver el vocabulario del dataset de entrenamiento.");
+    return;
+  }
+
+  console.log("Asignación de entrenamiento:", trainingAssignment);
+  console.log("Fuente resuelta:", trainingSource);
+  console.log(
+    "Fuentes disponibles:",
+    sources.map((source) => ({
+      name: source.name,
+      class_file: source.class_file,
+    }))
+  );
+
+const payload = {
+  name: form.name.trim(),
+  description: form.description.trim(),
+  model_name: form.model_name,
+  class_file: trainingSource.class_file ?? null,
+  datasets: datasetsPayload,
+  parameters: {
+    device: form.device,
+    image_size: Number(form.image_size),
+    batch_size: Number(form.batch_size),
+    epochs: Number(form.epochs),
+    learning_rate: Number(form.learning_rate),
+    weight_decay: Number(form.weight_decay),
+    patience: Number(form.patience),
+    seed: Number(form.seed),
+    freeze_backbone: form.freeze_backbone,
+    train_size: trainPercent / 100,
+    val_size: validationPercent / 100,
+    test_size: testPercent / 100,
+  },
+};
+
+    setSaving(true);
+
+    try {
+      const created = await request("/experiments", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+
+      setExperiments((current) => [
+        created,
+        ...current.filter(
+          (item) => item.experiment_id !== created.experiment_id,
+        ),
+      ]);
+
+      setSuccess(`Experimento creado: ${created.experiment_id}`);
+      setShowForm(false);
+
+      setForm({
+        ...INITIAL_FORM,
+        model_name: models[0]?.name ?? "",
+        datasets: sources[0]
+          ? [
+          {
+            source_name: sources[0].name,
+            role: "train_source",
+          },
+        ]
+      : [],
+    });
+
+    } catch (err) {
+      setFormError(err.message);
+    } finally {
+      setSaving(false);
+    }
+
+  }
+
+  async function refreshRuns() {
+    setRunsLoading(true);
+    try {
+      await loadRuns();
+    } finally {
+      setRunsLoading(false);
+    }
+  }
+
+  async function startRun(experiment) {
+    const experimentId = experiment?.experiment_id;
+    if (!experimentId) return;
+
+    if (hasActiveRun) {
+      setError("Ya hay un entrenamiento en curso. Esperá a que finalice antes de iniciar otro.");
+      return;
+    }
+
+    setLaunchingId(experimentId);
+    setError("");
+    setSuccess("");
+
+    try {
+      const created = await request(
+        `/experiments/${encodeURIComponent(experimentId)}/runs`,
+        { method: "POST" },
+      );
+
+      setRuns((current) => [
+        created,
+        ...current.filter((run) => run.run_id !== created.run_id),
+      ]);
+      setSuccess(`Entrenamiento iniciado: ${created.run_id}`);
+      await loadRuns();
+    } catch (err) {
+      setError(`No se pudo iniciar ${experimentId}: ${err.message}`);
+    } finally {
+      setLaunchingId(null);
+    }
+  }
+
+  async function evaluateRun(run) {
+  if (!run?.run_id || run.status !== "completed") return;
+
+  setEvaluatingRunId(run.run_id);
+  setEvaluationError("");
+  setError("");
+  setSuccess("");
+
+  try {
+    // Ejecutar la evaluación mediante FastAPI.
+    await request(
+      `/runs/${encodeURIComponent(run.run_id)}/evaluate`,
+      { method: "POST" }
+    );
+
+    // Recuperar las métricas y la matriz de confusión generadas.
+    const results = await request(
+      `/runs/${encodeURIComponent(run.run_id)}/results`
+    );
+
+    setSelectedEvaluation({
+      runId: run.run_id,
+      results,
+    });
+
+    setSuccess(`Evaluación completada: ${run.run_id}`);
+
+    // Llevar al usuario a la sección de resultados.
+    document.getElementById("evaluation-results")?.scrollIntoView({
+      behavior: "smooth",
+      block: "start",
+    });
+  } catch (err) {
+    setEvaluationError(
+      `No se pudo evaluar ${run.run_id}: ${err.message}`
+    );
+  } finally {
+    setEvaluatingRunId(null);
+  }
+}
+
+  async function cancelRun(run) {
+    if (!run?.run_id || !ACTIVE_RUN_STATUSES.has(run.status)) return;
+
+    const confirmed = window.confirm(
+      `¿Detener el entrenamiento ${run.run_id}?\n\n` +
+        "La ejecución quedará marcada como cancelada. Se conservará el historial de épocas ya completadas."
+    );
+    if (!confirmed) return;
+
+    setCancellingRunId(run.run_id);
+    setError("");
+    setSuccess("");
+    try {
+      await request(`/runs/${encodeURIComponent(run.run_id)}/cancel`, {
+        method: "POST",
+      });
+      setCancellationRequestedIds((current) => {
+        const next = new Set(current);
+        next.add(run.run_id);
+        return next;
+      });
+      setSuccess(
+        `Solicitud de detención enviada para ${run.run_id}. ` +
+          "Se marcará como cancelada cuando finalice el paso de entrenamiento en curso.",
+      );
+      await loadRuns();
+    } catch (err) {
+      setError(`No se pudo detener ${run.run_id}: ${err.message}`);
+    } finally {
+      setCancellingRunId(null);
+      setHoveredActiveRunId(null);
+    }
+  }
+
+  async function deleteExperiment(experiment) {
+    const { experiment_id, name } = experiment;
+
+    if (runsError) {
+      setError("No se puede verificar el historial de ejecuciones. Actualizá los datos e intentá nuevamente.");
+      return;
+    }
+
+    if (runs.some((run) => run.experiment_id === experiment_id)) {
+      setError(
+        `No se puede eliminar ${experiment_id}: tiene ejecuciones asociadas. El historial se conserva.`,
+      );
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `¿Querés eliminar el experimento "${name}" (${experiment_id})?\n\n` +
+        "Solo se eliminará la configuración. Los experimentos con ejecuciones asociadas no se pueden eliminar para conservar su historial."
+    );
+
+    if (!confirmed) return;
+
+    setDeletingId(experiment_id);
+    setError("");
+    setSuccess("");
+
+    try {
+      await request(`/experiments/${encodeURIComponent(experiment_id)}`, {
+        method: "DELETE",
+      });
+
+      setExperiments((current) =>
+        current.filter((item) => item.experiment_id !== experiment_id)
+      );
+
+      setSuccess(`Experimento ${experiment_id} eliminado correctamente.`);
+    } catch (err) {
+      setError(`No se pudo eliminar ${experiment_id}: ${err.message}`);
+    } finally {
+      setDeletingId(null);
+    }
+  }
+
+  return (
+    <div className="app-shell">
+      <aside className="sidebar">
+        <div className="brand">
+          <div className="brand-mark">LSA</div>
+          <div>
+            <strong>Gesture Lab</strong>
+            <span>Research workspace</span>
+          </div>
+        </div>
+
+        <div className="nav-label">WORKSPACE</div>
+
+        <nav>
+          <a className="nav-item active" href="#dashboard">
+            ▦ Dashboard
+          </a>
+          <a className="nav-item" href="#experiments">
+            ◈ Experimentos
+          </a>
+          <a className="nav-item" href="#runs">
+            ▷ Ejecuciones
+          </a>
+          <a className="nav-item" href="#resources">
+            ⌘ Recursos
+          </a>
+        </nav>
+
+        <div className="sidebar-footer">
+          <span className={`status-dot ${health}`} />
+          API{" "}
+          {health === "online"
+            ? "conectada"
+            : health === "checking"
+              ? "verificando..."
+              : "sin conexión"}
+        </div>
+      </aside>
+
+      <main className="main-content" id="dashboard">
+        <header className="topbar">
+          <div>
+            <span className="eyebrow">
+              TESIS · RECONOCIMIENTO DE GESTOS
+            </span>
+            <h1>Panel de investigación</h1>
+            <p>
+              Administrá experimentos y analizá ejecuciones de modelos.
+            </p>
+          </div>
+
+          <div className="api-badge">
+            <span className={`status-dot ${health}`} />
+            {health === "online"
+              ? "Sistema operativo"
+              : health === "checking"
+                ? "Conectando"
+                : "Error de conexión"}
+          </div>
+        </header>
+
+        {error && (
+          <div className="error-banner">
+            No se pudieron cargar todos los datos de la API: {error}
+            <button type="button" onClick={loadDashboard}>
+              Reintentar
+            </button>
+          </div>
+        )}
+
+        {success && <div className="success-banner">{success}</div>}
+
+        <section className="stats-grid">
+          <article className="stat-card">
+            <span className="stat-icon purple">◈</span>
+            <span className="stat-label">Experimentos</span>
+            <strong>{experiments.length}</strong>
+            <span className="stat-caption">Registrados en el sistema</span>
+          </article>
+
+          <article className="stat-card">
+            <span className="stat-icon blue">⌘</span>
+            <span className="stat-label">Modelos disponibles</span>
+            <strong>{models.length}</strong>
+            <span className="stat-caption">Opciones de arquitectura</span>
+          </article>
+
+          <article className="stat-card">
+            <span className="stat-icon green">▤</span>
+            <span className="stat-label">Fuentes de datos</span>
+            <strong>{sources.length}</strong>
+            <span className="stat-caption">Fuentes configuradas</span>
+          </article>
+
+          <article className="stat-card">
+            <span className="stat-icon orange">◉</span>
+            <span className="stat-label">API</span>
+            <strong className="api-stat">
+              {health === "online"
+                ? "Online"
+                : health === "checking"
+                  ? "..."
+                  : "Error"}
+            </strong>
+            <span className="stat-caption">FastAPI · REST</span>
+          </article>
+        </section>
+
+        <section className="content-panel" id="experiments">
+          <div className="panel-heading">
+            <div>
+              <h2>Experimentos</h2>
+              <p>Configuraciones registradas para la investigación.</p>
+            </div>
+
+            <div className="panel-actions">
+              <span className="count-badge">
+                {experiments.length} total
+              </span>
+              <button
+                type="button"
+                className="primary-button"
+                onClick={openForm}
+              >
+                + Nuevo experimento
+              </button>
+            </div>
+          </div>
+
+          {showForm && (
+            <form className="experiment-form" onSubmit={createExperiment}>
+              <div className="form-heading">
+                <div>
+                  <h3>Crear experimento</h3>
+                  <p>Definí el modelo y la fuente de datos inicial.</p>
+                </div>
+
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={() => {
+                    setShowForm(false);
+                    setFormError("");
+                  }}
+                  disabled={saving}
+                >
+                  Cancelar
+                </button>
+              </div>
+
+              <div className="form-grid">
+                <label>
+                  Nombre *
+                  <input
+                    name="name"
+                    value={form.name}
+                    onChange={updateForm}
+                    placeholder="Ej. ViT Tiny - Dataset original"
+                    required
+                    maxLength={120}
+                  />
+                </label>
+
+                <label>
+                  Modelo *
+                  <select
+                    name="model_name"
+                    value={form.model_name}
+                    onChange={updateForm}
+                    required
+                  >
+                    <option value="">Seleccionar modelo</option>
+                    {models.map((model) => (
+                      <option key={model.name} value={model.name}>
+                        {model.name} — {model.family}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                <div className="form-full">
+                  <h3>Datasets</h3>
+                  <p>
+                    Seleccioná las fuentes que participarán en el experimento
+                    y asignales un propósito.
+                  </p>
+
+                  {form.datasets.map((dataset, index) => (
+                    <div
+                      className="form-grid"
+                      key={`${dataset.source_name}-${index}`}
+                    >
+                      <label>
+                        Dataset *
+                        <select
+                          value={dataset.source_name}
+                          onChange={(event) =>
+                            updateDatasetAssignment(
+                              index,
+                              "source_name",
+                              event.target.value
+                            )
+                          }
+                          required
+                        >
+                          {sources.map((source) => (
+                            <option
+                              key={source.name}
+                              value={source.name}
+                              disabled={form.datasets.some(
+                                (item, i) =>
+                                  i !== index &&
+                                  item.source_name === source.name
+                              )}
+                            >
+                              {source.name} — {source.num_classes} clases · {source.num_images} imágenes
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+
+                      <label>
+                        Rol del dataset *
+                        <select
+                          value={dataset.role}
+                          onChange={(event) =>
+                            updateDatasetAssignment(
+                              index,
+                              "role",
+                              event.target.value
+                            )
+                          }
+                          required
+                        >
+                          {DATASET_ROLES.map((role) => (
+                            <option key={role.value} value={role.value}>
+                              {role.label}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+
+                      <div className="form-full">
+                        <button
+                          type="button"
+                          className="secondary-button"
+                          onClick={() => removeDatasetAssignment(index)}
+                        >
+                          Quitar dataset
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={addDatasetAssignment}
+                    disabled={form.datasets.length >= sources.length}
+                  >
+                    + Agregar dataset
+                  </button>
+
+                  <p className="form-note">
+                    Debe existir al menos un dataset asignado a Entrenamiento.
+                    Cada fuente puede asignarse una sola vez.
+                  </p>
+                </div>
+
+                                <div className="form-full">
+                  <h3>Distribución del dataset de entrenamiento</h3>
+
+                  <p>
+                    Definí cómo se dividirán los datos de las fuentes
+                    asignadas al entrenamiento.
+                  </p>
+
+                  <div className="form-grid">
+                    <label>
+                      Entrenamiento (%)
+                      <input
+                        type="number"
+                        name="train_percent"
+                        min="1"
+                        max="100"
+                        step="any"
+                        value={form.train_percent}
+                        onChange={updateForm}
+                        required
+                      />
+                    </label>
+
+                    <label>
+                      Validación (%)
+                      <input
+                        type="number"
+                        name="validation_percent"
+                        min="1"
+                        max="100"
+                        step="any"
+                        value={form.validation_percent}
+                        onChange={updateForm}
+                        required
+                      />
+                    </label>
+
+                    <label>
+                      Test (%)
+                      <input
+                        type="number"
+                        name="test_percent"
+                        min="1"
+                        max="100"
+                        step="any"
+                        value={form.test_percent}
+                        onChange={updateForm}
+                        required
+                      />
+                    </label>
+                  </div>
+
+                  <p className="form-note">
+                    Total:{" "}
+                    {(
+                      Number(form.train_percent || 0) +
+                      Number(form.validation_percent || 0) +
+                      Number(form.test_percent || 0)
+                    ).toFixed(2)}
+                    % — Los porcentajes deben sumar exactamente 100%.
+                  </p>
+
+                  <p className="form-note">
+                    La validación y el test interno se generan a partir de
+                    las fuentes asignadas a entrenamiento. Una fuente con
+                    rol Prueba final se conserva como conjunto independiente.
+                  </p>
+                </div>
+
+                <label>
+                  Dispositivo de ejecución *
+                  <select
+                    name="device"
+                    value={form.device}
+                    onChange={updateForm}
+                    required
+                  >
+                    <option value="auto">Automático</option>
+                    <option value="cpu">CPU</option>
+                    <option value="cuda">GPU NVIDIA (CUDA)</option>
+                  </select>
+                </label>
+
+                <label>
+                  Tamaño de imagen *
+                  <input
+                    type="number"
+                    name="image_size"
+                    min="1"
+                    value={form.image_size}
+                    onChange={updateForm}
+                    required
+                  />
+                </label>
+
+                <label>
+                  Tamaño del batch *
+                  <input
+                    type="number"
+                    name="batch_size"
+                    min="1"
+                    value={form.batch_size}
+                    onChange={updateForm}
+                    required
+                  />
+                </label>
+
+                <label>
+                  Épocas *
+                  <input
+                    type="number"
+                    name="epochs"
+                    min="1"
+                    value={form.epochs}
+                    onChange={updateForm}
+                    required
+                  />
+                </label>
+
+                <label>
+                  Learning rate *
+                  <input
+                    type="number"
+                    name="learning_rate"
+                    min="0.0000001"
+                    step="any"
+                    value={form.learning_rate}
+                    onChange={updateForm}
+                    required
+                  />
+                </label>
+
+                <label>
+                  Weight decay *
+                  <input
+                    type="number"
+                    name="weight_decay"
+                    min="0"
+                    step="any"
+                    value={form.weight_decay}
+                    onChange={updateForm}
+                    required
+                  />
+                </label>
+
+                <label>
+                  Paciencia (early stopping) *
+                  <input
+                    type="number"
+                    name="patience"
+                    min="1"
+                    value={form.patience}
+                    onChange={updateForm}
+                    required
+                  />
+                </label>
+
+                <label>
+                  Semilla aleatoria *
+                  <input
+                    type="number"
+                    name="seed"
+                    min="0"
+                    value={form.seed}
+                    onChange={updateForm}
+                    required
+                  />
+                </label>
+
+                <label className="form-full">
+                  <input
+                    type="checkbox"
+                    name="freeze_backbone"
+                    checked={form.freeze_backbone}
+                    onChange={(event) =>
+                      setForm((current) => ({
+                        ...current,
+                        freeze_backbone: event.target.checked,
+                      }))
+                    }
+                  />
+                  Congelar backbone durante el entrenamiento
+                </label>
+
+                <label className="form-f-ull">
+                  Descripción
+                  <textarea
+                    name="description"
+                    value={form.description}
+                    onChange={updateForm}
+                    placeholder="Objetivo o hipótesis del experimento"
+                    rows={3}
+                  />
+                </label>
+              </div>
+
+              <div className="form-note">
+                La ID se genera automáticamente. Para que el experimento
+                pueda crearse, al menos una fuente debe tener el rol
+                Entrenamiento.
+              </div>
+
+              {formError && (
+                <div className="error-banner">{formError}</div>
+              )}
+
+              <div className="form-actions">
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={() => {
+                    setShowForm(false);
+                    setFormError("");
+                  }}
+                  disabled={saving}
+                >
+                  Cancelar
+                </button>
+
+                <button
+                  type="submit"
+                  className="primary-button"
+                  disabled={
+                    saving || models.length === 0 || sources.length === 0
+                  }
+                >
+                  {saving ? "Creando..." : "Crear experimento"}
+                </button>
+              </div>
+            </form>
+          )}
+
+          {/* Tabla de experimentos: encabezado y filas tienen seis columnas. */}
+          {experiments.length > 0 ? (
+            <div className="table-wrapper">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Experimento</th>
+                    <th>Modelo</th>
+                    <th>Fuente de datos</th>
+                    <th>Rol</th>
+                    <th>Descripción</th>
+                    <th>ID</th>
+                    <th>Acciones</th>
+                  </tr>
+                </thead>
+
+                <tbody>
+                  {experiments.map((experiment, index) => (
+                    <tr key={experiment.experiment_id ?? index}>
+                      <td>
+                        <strong>{experiment.name ?? "Sin nombre"}</strong>
+                      </td>
+
+                      <td>{experiment.model_name ?? "—"}</td>
+
+                      <td>
+                        {experiment.datasets?.length
+                          ? experiment.datasets.map((dataset, datasetIndex) => (
+                              <div
+                                key={`${dataset.source_name}-${datasetIndex}`}
+                              >
+                                {dataset.source_name ?? "—"}
+                              </div>
+                            ))
+                          : "—"}
+                      </td>
+
+                      <td>
+                        {experiment.datasets?.length
+                          ? experiment.datasets.map((dataset, datasetIndex) => (
+                              <div
+                                key={`${dataset.source_name}-${datasetIndex}`}
+                              >
+                                {ROLE_LABELS[dataset.role] ??
+                                  dataset.role ??
+                                  "—"}
+                              </div>
+                            ))
+                          : "—"}
+                      </td>
+                      <td>{experiment.description || "—"}</td>
+                      <td>
+                        <code>
+                          {experiment.experiment_id ?? "Sin ID"}
+                        </code>
+                      </td>
+                      <td>
+                        <div className="panel-actions">
+                          {(() => {
+                            const activeRun = runs.find(
+                              (run) =>
+                                run.experiment_id === experiment.experiment_id &&
+                                ACTIVE_RUN_STATUSES.has(run.status),
+                            );
+                            const isHovered = activeRun && hoveredActiveRunId === activeRun.run_id;
+                            const isCancelling = activeRun && (
+                              cancellingRunId === activeRun.run_id ||
+                              cancellationRequestedIds.has(activeRun.run_id)
+                            );
+                            return (
+                              <button
+                                type="button"
+                                className={activeRun ? "secondary-button" : "primary-button"}
+                                disabled={
+                                  !experiment.experiment_id ||
+                                  (hasActiveRun && !activeRun) ||
+                                  launchingId !== null ||
+                                  Boolean(isCancelling)
+                                }
+                                onMouseEnter={() => activeRun && setHoveredActiveRunId(activeRun.run_id)}
+                                onMouseLeave={() => setHoveredActiveRunId(null)}
+                                onClick={() => activeRun ? cancelRun(activeRun) : startRun(experiment)}
+                                title={activeRun ? "Detener este entrenamiento" : hasActiveRun ? "Hay otro entrenamiento en curso" : "Iniciar entrenamiento con esta configuración"}
+                                style={activeRun && isHovered ? { background: "#b91c1c", color: "#ffffff", borderColor: "#b91c1c" } : undefined}
+                              >
+                                {launchingId === experiment.experiment_id
+                                  ? "Iniciando..."
+                                  : isCancelling
+                                    ? "Deteniendo..."
+                                    : activeRun
+                                      ? isHovered ? "Detener" : "Ejecución activa"
+                                      : hasActiveRun
+                                        ? "Ejecución activa"
+                                        : "Ejecutar"}
+                              </button>
+                            );
+                          })()}
+                          <button
+                            type="button"
+                            className="secondary-button"
+                            disabled={
+                              !experiment.experiment_id ||
+                              deletingId !== null ||
+                              Boolean(runsError) ||
+                              runs.some(
+                                (run) => run.experiment_id === experiment.experiment_id,
+                              )
+                            }
+                            title={
+                              runsError
+                                ? "No se puede verificar el historial de ejecuciones."
+                                : runs.some(
+                                    (run) => run.experiment_id === experiment.experiment_id,
+                                  )
+                                  ? "No se puede eliminar: el experimento tiene ejecuciones asociadas y su historial se conserva."
+                                  : "Eliminar experimento"
+                            }
+                            onClick={() => deleteExperiment(experiment)}
+                          >
+                            {deletingId === experiment.experiment_id
+                              ? "Eliminando..."
+                              : runsError
+                                ? "Historial no disponible"
+                                : runs.some(
+                                    (run) => run.experiment_id === experiment.experiment_id,
+                                  )
+                                  ? "Con historial"
+                                  : "Eliminar"}
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <div className="empty-state">
+              <div className="empty-icon">◈</div>
+              <h3>
+                {error
+                  ? "No se pudieron cargar los experimentos"
+                  : "Todavía no hay experimentos"}
+              </h3>
+              <p>
+                {error
+                  ? "Revisá la conexión con la API y los registros del backend."
+                  : "Creá tu primer experimento para comenzar a registrar configuraciones."}
+              </p>
+            </div>
+          )}
+        </section>
+
+        <section className="content-panel" id="runs">
+          <div className="panel-heading">
+            <div>
+              <h2>Ejecuciones recientes</h2>
+              <p>Seguimiento de los entrenamientos realizados.</p>
+            </div>
+            <div className="panel-actions">
+              <span className="count-badge">{runs.length} total</span>
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={refreshRuns}
+                disabled={runsLoading}
+              >
+                {runsLoading ? "Actualizando..." : "Actualizar"}
+              </button>
+            </div>
+          </div>
+
+          {runsError && (
+            <div className="error-banner">
+              No se pudieron cargar las ejecuciones: {runsError}
+            </div>
+          )}
+
+          {runs.length > 0 ? (
+            <div className="table-wrapper">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Estado</th>
+                    <th>Experimento</th>
+                    <th>Modelo</th>
+                    <th>Progreso</th>
+                    <th>Creada</th>
+                    <th>ID de ejecución</th>
+                    <th>Acciones</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {runs.map((run) => {
+                    const experiment = experiments.find(
+                      (item) => item.experiment_id === run.experiment_id,
+                    );
+                    const history = runHistories[run.run_id] ?? [];
+                    const latestEpoch = history[history.length - 1];
+                    const expectedEpochs = Number(
+                      experiment?.parameters?.epochs ?? 0,
+                    );
+
+                    return (
+                      <tr key={run.run_id}>
+                        <td>
+                          <strong>{RUN_STATUS_LABELS[run.status] ?? run.status}</strong>
+                          {run.error_message && (
+                            <div className="resource-detail">{run.error_message}</div>
+                          )}
+                        </td>
+                        <td>
+                          {experiment?.name ?? run.experiment_id}
+                          <div className="resource-detail">{run.experiment_id}</div>
+                        </td>
+                        <td>{experiment?.model_name ?? "—"}</td>
+                        <td>
+                          {latestEpoch
+                            ? `Época ${latestEpoch.epoch}${expectedEpochs ? ` / ${expectedEpochs}` : ""}`
+                            : ACTIVE_RUN_STATUSES.has(run.status)
+                              ? "Preparando entrenamiento..."
+                              : "—"}
+                          {latestEpoch && (
+                            <div className="resource-detail">
+                              Val. accuracy: {(latestEpoch.val_accuracy * 100).toFixed(2)}%
+                            </div>
+                          )}
+                        </td>
+                        <td>{formatDate(run.created_at)}</td>
+                        <td>
+                          <code>{run.run_id}</code>
+                        </td>
+
+                        <td>
+                          {run.status === "completed" ? (
+                            <button
+                              type="button"
+                              className="primary-button"
+                              onClick={() => evaluateRun(run)}
+                              disabled={evaluatingRunId !== null}
+                            >
+                              {evaluatingRunId === run.run_id
+                              ? "Evaluando..."
+                              : "Evaluar"}
+                            </button>
+                          ) : (
+                            <span className="resource-detail">
+                              No disponible
+                            </span>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <div className="empty-state compact">
+              <p>
+                {runsError
+                  ? "Revisá la conexión con la API para consultar las ejecuciones."
+                  : "Todavía no hay ejecuciones. Usá Ejecutar en un experimento para iniciar el primer entrenamiento."}
+              </p>
+            </div>
+          )}
+          {hasActiveRun && (
+            <p className="form-note">
+              Hay un entrenamiento activo. Los estados y las métricas se actualizan automáticamente cada 5 segundos.
+            </p>
+          )}
+        </section>
+
+        {evaluationError && (
+          <div className="error-banner" role="alert">
+            {evaluationError}
+          </div>
+        )}
+
+        {selectedEvaluation && (() => {
+            const result = selectedEvaluation.results;
+
+            // Evaluaciones agrupadas por fuente de datos.
+            const tests = result?.tests ?? {};
+            const testKeys = Object.keys(tests);
+
+            // Usar la fuente seleccionada si existe.
+            // Si no existe, seleccionar la primera disponible.
+            const activeTestKey = tests[selectedTestKey]
+                ? selectedTestKey
+                : testKeys[0];
+
+            const test = activeTestKey ? tests[activeTestKey] : null;
+            const metrics = test?.metrics ?? {};
+            const matrix = test?.confusion_matrix ?? [];
+            const classNames = Object.keys(test?.per_class ?? {});
+
+            const resources = [
+                ["Fuente evaluada", activeTestKey ?? "—"],
+                ["Modelo", result?.model ?? "—"],
+                ["Arquitectura", result?.architecture ?? "—"],
+                ["Dispositivo solicitado", result?.requested_device ?? "—"],
+                ["Dispositivo utilizado", result?.device ?? "—"],
+                ["Checkpoint", result?.checkpoint_path ?? "—"],
+                ["Partición evaluada", test?.partition ?? "—"],
+                ["Muestras evaluadas", test?.num_samples ?? "—"],
+            ];
+
+            const formatMetric = (value) => {
+                if (value == null || !Number.isFinite(Number(value))) {
+                    return "—";
+                }
+
+                return `${(Number(value) * 100).toFixed(2)}%`;
+            };
+
+            const metricCards = [
+                {
+                    label: "Accuracy",
+                    value: metrics.accuracy,
+                },
+                {
+                    label: "F1 macro",
+                    value: metrics.f1_macro ?? metrics.macro_f1,
+                },
+                {
+                    label: "Precisión macro",
+                    value: metrics.precision_macro,
+                },
+                {
+                    label: "Recall macro",
+                    value: metrics.recall_macro,
+                },
+            ];
+
+            return (
+                <section
+                    className="content-panel"
+                    id="evaluation-results"
+                >
+                    <div className="panel-heading">
+                        <div>
+                            <h2>Resultados de evaluación</h2>
+                            <p>
+                                Ejecución: {selectedEvaluation.runId}
+                            </p>
+                        </div>
+
+                        <button
+                            type="button"
+                            className="secondary-button"
+                            onClick={() => {
+                                setSelectedEvaluation(null);
+                                setSelectedTestKey("original");
+                            }}
+                        >
+                            Cerrar
+                        </button>
+                    </div>
+
+                    {testKeys.length > 0 ? (
+                        <>
+                            <div className="evaluation-details">
+                                <label htmlFor="evaluation-source">
+                                    <strong>Conjunto evaluado</strong>
+                                </label>
+
+                                <select
+                                    id="evaluation-source"
+                                    value={activeTestKey ?? ""}
+                                    onChange={(event) =>
+                                        setSelectedTestKey(event.target.value)
+                                    }
+                                >
+                                    {testKeys.map((key) => (
+                                        <option key={key} value={key}>
+                                            {key}
+                                        </option>
+                                    ))}
+                                </select>
+
+                                <p className="resource-detail">
+                                    Partición: {test?.partition ?? "—"} ·
+                                    {" "}Muestras: {test?.num_samples ?? "—"}
+                                </p>
+                            </div>
+
+                            <div className="evaluation-grid">
+                                {metricCards.map((metric) => (
+                                    <article
+                                        className="stat-card"
+                                        key={metric.label}
+                                    >
+                                        <span className="stat-label">
+                                            {metric.label}
+                                        </span>
+
+                                        <strong>
+                                            {formatMetric(metric.value)}
+                                        </strong>
+                                    </article>
+                                ))}
+                            </div>
+
+                            <div className="evaluation-details">
+                                <h3>Métricas adicionales</h3>
+
+                                <p>
+                                    <strong>Loss:</strong>{" "}
+                                    {Number.isFinite(Number(metrics.loss)) &&
+                                    metrics.loss != null
+                                        ? Number(metrics.loss).toFixed(5)
+                                        : "—"}
+                                </p>
+
+                                <p>
+                                    <strong>Clases:</strong>{" "}
+                                    {result?.num_classes ?? classNames.length ?? "—"}
+                                </p>
+
+                                <p>
+                                    <strong>Dispositivo:</strong>{" "}
+                                    {result?.device ?? "—"}
+                                </p>
+
+                                <h3>Matriz de confusión</h3>
+
+                                <p className="resource-detail">
+                                    Filas: clase real · Columnas: clase predicha.
+                                </p>
+
+                                {Array.isArray(matrix) && matrix.length > 0 ? (
+                                    <div className="confusion-wrapper">
+                                        <table className="confusion-matrix">
+                                            <thead>
+                                                <tr>
+                                                    <th className="matrix-axis-label">
+                                                        Real ↓ / Pred. →
+                                                    </th>
+
+                                                    {matrix.map((_, index) => (
+                                                        <th
+                                                            key={index}
+                                                            title={`Clase predicha: ${
+                                                                classNames[index] ?? index
+                                                            }`}
+                                                        >
+                                                            {classNames[index] ?? index}
+                                                        </th>
+                                                    ))}
+                                                </tr>
+                                            </thead>
+
+                                            <tbody>
+                                                {matrix.map((row, rowIndex) => (
+                                                    <tr key={rowIndex}>
+                                                        <th
+                                                            scope="row"
+                                                            title={`Clase real: ${
+                                                                classNames[rowIndex] ?? rowIndex
+                                                            }`}
+                                                        >
+                                                            {classNames[rowIndex] ?? rowIndex}
+                                                        </th>
+
+                                                        {row.map((value, colIndex) => (
+                                                            <td
+                                                                key={colIndex}
+                                                                className={
+                                                                    rowIndex === colIndex
+                                                                        ? "matrix-diagonal"
+                                                                        : value > 0
+                                                                          ? "matrix-error"
+                                                                          : ""
+                                                                }
+                                                                title={`Real: ${
+                                                                    classNames[rowIndex] ?? rowIndex
+                                                                }; predicha: ${
+                                                                    classNames[colIndex] ?? colIndex
+                                                                }; cantidad: ${value}`}
+                                                            >
+                                                                {value}
+                                                            </td>
+                                                        ))}
+                                                    </tr>
+                                                ))}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                ) : (
+                                    <p className="resource-detail">
+                                        La API no devolvió una matriz de confusión
+                                        en el formato esperado para esta fuente.
+                                    </p>
+                                )}
+
+                                <h3>Configuración y recursos utilizados</h3>
+
+                                <div className="evaluation-resources">
+                                    {resources.map(([label, value]) => (
+                                        <div
+                                            className="evaluation-resource"
+                                            key={label}
+                                        >
+                                            <span>{label}</span>
+                                            <strong>{String(value)}</strong>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        </>
+                    ) : (
+                        <p className="resource-detail">
+                            La API no devolvió evaluaciones agrupadas por fuente
+                            en result.tests. Revisá la estructura de la respuesta
+                            del endpoint /results.
+                        </p>
+                    )}
+                </section>
+            );
+        })()}
+
+
+        <section className="content-panel" id="resources">
+          <div className="panel-heading">
+            <div>
+              <h2>Recursos disponibles</h2>
+              <p>Modelos y datasets detectados por el backend al iniciar.</p>
+            </div>
+          </div>
+
+          <div className="resource-grid">
+            <div className="resource-card">
+              <span>MODELOS</span>
+              <strong>{models.length}</strong>
+              {models.length > 0 ? (
+                models.map((model) => (
+                  <p key={model.name}>
+                    {model.name}{" "}
+                    <span className="resource-detail">{model.family}</span>
+                  </p>
+                ))
+              ) : (
+                <p>No se encontraron modelos.</p>
+              )}
+            </div>
+
+            <div className="resource-card">
+              <span>DATASETS VÁLIDOS</span>
+              <strong>{sources.length}</strong>
+              {sources.length > 0 ? (
+                sources.map((source) => (
+                  <p key={source.name}>
+                    <strong>{source.name}</strong>
+                    <span className="resource-detail">
+                      {source.num_classes} clases · {source.num_images} imágenes
+                    </span>
+                    <span className="resource-detail">
+                      {source.description}
+                    </span>
+                    <span className="resource-detail">
+                      Clases: {(source.classes ?? []).join(", ")}
+                    </span>
+                  </p>
+                ))
+              ) : (
+                <p>No se detectaron datasets válidos.</p>
+              )}
+            </div>
+
+            {invalidSources.length > 0 && (
+              <div className="resource-card resource-card-warning">
+                <span>CARPETAS RECHAZADAS</span>
+                <strong>{invalidSources.length}</strong>
+                {invalidSources.map((source) => (
+                  <p key={`${source.name}-${source.path}`}>
+                    <strong>{source.name}</strong>
+                    <span className="resource-detail">{source.path}</span>
+                    <span className="resource-detail">{source.reason}</span>
+                  </p>
+                ))}
+              </div>
+            )}
+          </div>
+        </section>
+
+        <footer>
+          <span>Gesture Lab · Proyecto de tesis</span>
+          <span>React + FastAPI + Docker</span>
+        </footer>
+      </main>
+    </div>
+  );
+}
+
+export default App;
+
+
+
+========== docker-compose.yml ==========
+
+services:
+  tesis:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tesis_gestos
+    working_dir: /workspace
+    gpus: all
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./:/workspace
+    ports:
+      - "8000:8000"
+    stdin_open: true
+    tty: true
+    command:
+      - bash
+      - -lc
+      - python3 -m uvicorn src.api.main:app --host 0.0.0.0 --port 8000
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: tesis_gestos_frontend
+    working_dir: /app
+    volumes:
+      - ./frontend:/app
+      - frontend_node_modules:/app/node_modules
+    ports:
+      - "5173:5173"
+    depends_on:
+      - tesis
+
+volumes:
+  frontend_node_modules:
+
+
+
+========== Dockerfile ==========
+
+FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    python3-pip \
+    python3-dev \
+    libglib2.0-0 \
+    libgl1 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN ln -sf /usr/bin/python3 /usr/local/bin/python
+
+WORKDIR /workspace
+
+COPY requirements.txt /workspace/requirements.txt
+COPY requirements-dev.txt /workspace/requirements-dev.txt
+
+RUN python3 -m pip install --no-cache-dir --upgrade pip \
+    && python3 -m pip install --no-cache-dir -r /workspace/requirements-dev.txt
+
+CMD ["bash", "-lc", "sleep infinity"]

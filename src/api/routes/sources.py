@@ -1,4 +1,4 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 
 from src.api.dependencies import PROJECT_ROOT
 from src.core.configuracion.catalogo import cargar_catalogos
@@ -8,10 +8,10 @@ router = APIRouter(tags=["Datos"])
 
 
 @router.get("/api/sources")
-def get_sources() -> dict:
-    """Devuelve los datasets válidos detectados y los rechazados con su motivo."""
+def get_sources(refresh: bool = Query(False)) -> dict:
+    """Devuelve datasets detectados; refresh=True vuelve a escanear data/."""
     _, scenarios = cargar_catalogos()
-    catalog = get_dataset_catalog(PROJECT_ROOT)
+    catalog = get_dataset_catalog(PROJECT_ROOT, refresh=refresh)
 
     return {
         "sources": catalog["sources"],

@@ -19,3 +19,6 @@ Thumbs.db
 # Archivos locales de respaldo y listados
 tesis_gestos V29-10-26.zip
 archivos_tesis.txt
+
+# Resultados históricos de experimentos
+results_historico/

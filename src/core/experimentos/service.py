@@ -299,17 +299,18 @@ class ExperimentService:
         cancel_event: Event | None = None,
     ) -> RunRecord:
         """Ejecuta el entrenamiento y persiste el estado de la ejecución."""
-        spec = self.get_experiment(experiment_id)
-        self.validate_experiment(spec)
-
         run_id = run_id or uuid.uuid4().hex
+        spec = None
         try:
+            # Cargar primero el registro de ejecución: cualquier error posterior,
+            # incluida la validación de datasets personalizados, debe quedar
+            # asociado a un estado terminal y no dejar la ejecución en pending.
             try:
                 run = self.registry.load_run(run_id)
             except FileNotFoundError:
-                run = self.create_run(spec.experiment_id, run_id=run_id)
+                run = self.create_run(experiment_id, run_id=run_id)
 
-            if run.experiment_id != spec.experiment_id:
+            if run.experiment_id != experiment_id:
                 raise ValueError("La ejecución no pertenece al experimento indicado.")
             if run.status != "pending":
                 raise ValueError(
@@ -317,6 +318,8 @@ class ExperimentService:
                 )
             self.registry.update_run_status(run_id, "running")
 
+            spec = self.get_experiment(experiment_id)
+            self.validate_experiment(spec)
             config = self._build_config(spec)
             device = self._resolve_device(config.device)
 
@@ -378,7 +381,7 @@ class ExperimentService:
             model_spec = get_model_spec(spec.model_name)
 
             model = crear_modelo(
-                architecture=config.model.architecture,
+                arquitectura=config.model.architecture,
                 num_classes=config.num_classes,
                 pretrained=config.model.pretrained,
                 dispositivo=device,
@@ -440,10 +443,12 @@ class ExperimentService:
                     )
                     for item in active_assignments
                 },
+
                 "split_paths": {
                     name: self.paths.relative_to_root(prepared[name].split_path)
-                    for name in active_source_names
+                    for name in source_names
                 },
+                
                 "fingerprints": {
                     name: dataset_fingerprint(prepared[name].dataset)
                     for name in active_source_names
@@ -631,7 +636,7 @@ class ExperimentService:
         except TrainingCancelled as exc:
             try:
                 current = self.registry.load_run(run_id)
-                if current.experiment_id == spec.experiment_id and current.status in {"pending", "running"}:
+                if current.status in {"pending", "running"}:
                     return self.registry.update_run_status(
                         run_id,
                         "cancelled",
@@ -644,8 +649,7 @@ class ExperimentService:
             try:
                 current = self.registry.load_run(run_id)
                 if (
-                    current.experiment_id == spec.experiment_id
-                    and current.status in {"pending", "running"}
+                    current.status in {"pending", "running"}
                 ):
                     self.registry.update_run_status(
                         run_id,

@@ -33,8 +33,8 @@ SOURCE_NAMES = tuple(SOURCE_DEFINITIONS)
 class PreparedSource:
     name: str
     dataset: GestosDataset
-    split: DatasetSplit
-    split_path: Path
+    split: DatasetSplit | None
+    split_path: Path | None
 
 
 def source_paths(
@@ -105,6 +105,11 @@ def prepare_sources(
         else None
     )
 
+    roles_by_source = {
+        assignment.source_name: assignment.role
+        for assignment in source_assignments
+    } if source_assignments is not None else {}
+
     if inventory is not None:
         validate_global_preflight(
             inventory=inventory,
@@ -140,8 +145,10 @@ def prepare_sources(
             ),
             excluded_paths=excluded_paths_by_source.get(name, set()),
         )
+
         fingerprint = dataset_fingerprint(dataset)
-        split_path = paths.source_split_path(
+
+        split_config_path = paths.source_split_path(
             name,
             dataset_fingerprint=fingerprint,
             seed=config.split_seed,
@@ -149,40 +156,68 @@ def prepare_sources(
             val_size=config.val_size,
             test_size=config.test_size,
         )
-        _guardar_manifest_duplicados(dataset, split_path.with_suffix(".duplicados_exactos.csv"))
-        if regenerate_splits or not split_path.exists():
-            if not create_missing_splits and not regenerate_splits:
-                raise FileNotFoundError(
-                    f"No existe la partición de '{name}': {split_path}. "
-                    "Entrená primero o autorizá la creación de particiones."
+
+        is_training_source = (
+            roles_by_source.get(name, "train_source") == "train_source"
+        )
+
+        _guardar_manifest_duplicados(
+            dataset,
+            split_config_path.with_suffix(".duplicados_exactos.csv"),
+        )
+
+        if is_training_source:
+            split_path = split_config_path
+
+            if regenerate_splits or not split_path.exists():
+                if not create_missing_splits and not regenerate_splits:
+                    raise FileNotFoundError(
+                        f"No existe la partición de '{name}': {split_path}. "
+                        "Entrená primero o autorizá la creación de particiones."
+                    )
+
+                split = dividir_dataset(
+                    dataset.etiquetas,
+                    config.train_size,
+                    config.val_size,
+                    config.test_size,
+                    config.split_seed,
+                    grupos=[
+                        record.group_id
+                        for record in dataset.records
+                    ],
                 )
-            split = dividir_dataset(
-                dataset.etiquetas,
-                config.train_size,
-                config.val_size,
-                config.test_size,
-                config.split_seed,
-                grupos=[record.group_id for record in dataset.records],
-            )
-            guardar_split(
-                split_path,
-                split,
-                dataset,
-                config.split_seed,
-                config.train_size,
-                config.val_size,
-                config.test_size,
-            )
+
+                guardar_split(
+                    split_path,
+                    split,
+                    dataset,
+                    config.split_seed,
+                    config.train_size,
+                    config.val_size,
+                    config.test_size,
+                )
+
+            else:
+                split = cargar_split(
+                    split_path,
+                    dataset,
+                    expected_seed=config.split_seed,
+                    train_size=config.train_size,
+                    val_size=config.val_size,
+                    test_size=config.test_size,
+                )
+
         else:
-            split = cargar_split(
-                split_path,
-                dataset,
-                expected_seed=config.split_seed,
-                train_size=config.train_size,
-                val_size=config.val_size,
-                test_size=config.test_size,
-            )
-        prepared[name] = PreparedSource(name, dataset, split, split_path)
+            split = None
+            split_path = None
+
+        prepared[name] = PreparedSource(
+            name,
+            dataset,
+            split,
+            split_path,
+        )
 
         _validate_group_partition_consistency(
             prepared,
@@ -256,6 +291,9 @@ def _validate_group_partition_consistency(
         if training_sources is not None and source_name not in training_sources:
             continue
 
+        if source.split is None:
+            continue
+
         split_by_index: dict[int, str] = {}
 
         for partition_name in ("train", "val", "test"):
@@ -294,7 +332,32 @@ def _validate_group_partition_consistency(
                 )
 
 
-def subset_for(source: PreparedSource, partition: str, transform=None) -> DatasetSubset:
+def subset_for(
+    source: PreparedSource,
+    partition: str,
+    transform=None,
+) -> DatasetSubset:
     if partition not in {"train", "val", "test"}:
         raise ValueError(f"Partición desconocida: {partition}")
-    return DatasetSubset(source.dataset, getattr(source.split, partition), transform)
+
+    if source.split is None:
+        raise ValueError(
+            f"La fuente '{source.name}' no tiene particiones internas."
+        )
+
+    return DatasetSubset(
+        source.dataset,
+        getattr(source.split, partition),
+        transform,
+    )
+
+def full_dataset_for(
+    source: PreparedSource,
+    transform=None,
+) -> DatasetSubset:
+    """Devuelve la fuente completa, sin aplicar particiones internas."""
+    return DatasetSubset(
+        source.dataset,
+        range(len(source.dataset)),
+        transform,
+    )

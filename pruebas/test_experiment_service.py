@@ -402,3 +402,72 @@ def test_validate_experiment_accepts_distinct_dataset_roles(tmp_path):
         service.validate_experiment(spec)
 
     assert mock_inspect.call_count == 2
+
+
+def test_run_validation_error_marks_pending_run_as_failed(tmp_path, monkeypatch):
+    """Una validación fallida no debe dejar el registro en pending."""
+    dataset_path = tmp_path / "dataset"
+    dataset_path.mkdir()
+    service = ExperimentService(tmp_path)
+    spec = make_spec(dataset_path)
+    service.registry.save_experiment(spec)
+    run = service.create_run(spec.experiment_id)
+
+    monkeypatch.setattr(
+        ExperimentService,
+        "validate_experiment",
+        lambda self, loaded_spec: (_ for _ in ()).throw(
+            ValueError("vocabulario incompatible del dataset extendido")
+        ),
+    )
+
+    with pytest.raises(ValueError, match="vocabulario incompatible"):
+        service.run_experiment(spec.experiment_id, run_id=run.run_id)
+
+    stored = service.get_run(run.run_id)
+    assert stored.status == "failed"
+    assert "vocabulario incompatible" in stored.error_message
+    assert stored.finished_at is not None
+
+
+def test_validate_experiment_accepts_auto_discovered_extended_dataset(tmp_path):
+    import cv2
+    import json
+    import numpy as np
+
+    from src.core.configuracion.discovery import get_dataset_catalog
+
+    dataset_path = tmp_path / "data" / "dataset_extendido"
+    for class_name in ("A", "B", "C"):
+        class_dir = dataset_path / class_name
+        class_dir.mkdir(parents=True)
+        image = np.full((12, 12, 3), 80, dtype=np.uint8)
+        assert cv2.imwrite(str(class_dir / "imagen.jpg"), image)
+
+    catalog = get_dataset_catalog(tmp_path, refresh=True)
+    source = next(
+        item for item in catalog["sources"]
+        if item["name"] == "dataset_extendido"
+    )
+    class_file = source["class_file"]
+
+    spec = ExperimentSpec(
+        name="Prueba dataset extendido",
+        model_name="mobilenetv2",
+        datasets=(
+            DatasetAssignment(
+                source_name="dataset_extendido",
+                path=source["path"],
+                role="train_source",
+            ),
+        ),
+        class_file=class_file,
+        parameters={},
+    )
+
+    service = ExperimentService(tmp_path)
+    # El catálogo detectado pertenece al mismo root temporal de este test.
+    service.validate_experiment(spec)
+
+    loaded_classes = json.loads((tmp_path / class_file).read_text())
+    assert loaded_classes["classes"] == ["A", "B", "C"]

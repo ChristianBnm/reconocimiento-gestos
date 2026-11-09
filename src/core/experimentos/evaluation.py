@@ -14,16 +14,23 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from src.core.configuracion.settings import ExperimentConfig
-from src.core.dataset.experiment import (
-    ProjectPaths,
-    prepare_sources,
-    subset_for,
-)
 from src.core.dataset.transforms import build_eval_transform
 from src.core.experimentos.schemas import RunRecord
 from src.core.experimentos.service import ExperimentService
 from src.core.modelos.factory import crear_modelo
 from src.core.dataset.split import dataset_fingerprint
+from src.core.dataset.experiment import (
+    ProjectPaths,
+    prepare_sources,
+    subset_for,
+    full_dataset_for,
+)
+from src.core.dataset.experiment import (
+    ProjectPaths,
+    prepare_sources,
+    subset_for,
+    full_dataset_for,
+)
 
 
 def _guardar_json_atomico(path: Path, contenido: dict) -> None:
@@ -367,11 +374,25 @@ def evaluar_ejecucion(
     for assignment in source_assignments:
         name = assignment.source_name
 
-        dataset = subset_for(
-            prepared[name],
-            "test",
-            transform,
-        )
+        if assignment.role == "train_source":
+            dataset = subset_for(
+                prepared[name],
+                "test",
+                transform,
+            )
+            partition = "test"
+
+        elif assignment.role in {"final_test", "external_eval"}:
+            dataset = full_dataset_for(
+                prepared[name],
+                transform,
+            )
+            partition = "full"
+
+        else:
+            raise ValueError(
+                f"Rol de evaluación no reconocido: {assignment.role!r}"
+            )
 
         loader = DataLoader(
             dataset,
@@ -435,8 +456,8 @@ def evaluar_ejecucion(
 
         if total == 0:
             raise ValueError(
-                f"La partición test de '{name}' está vacía."
-            )
+                f"El conjunto de evaluación de '{name}' está vacío."
+        )
 
         tp = confusion.diag().double()
         support = confusion.sum(dim=1).double()
@@ -469,7 +490,7 @@ def evaluar_ejecucion(
         per_source = {
             "source": name,
             "role": assignment.role,
-            "partition": "test",
+            "partition": partition,
             "num_samples": total,
             "metrics": {
                 "loss": total_loss / total,

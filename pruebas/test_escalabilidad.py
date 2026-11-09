@@ -1,4 +1,3 @@
-"""
 from __future__ import annotations
 
 import json
@@ -182,58 +181,112 @@ def test_dataset_falla_si_hay_una_clase_no_configurada(tmp_path):
         GestosDataset(root, class_names=("A",))
 
 
-def test_prepare_sources_reutiliza_particiones_y_versiona_cambios(tmp_path):
-    from src.core.dataset.experiment import SOURCE_NAMES, prepare_sources
+
+
+def test_prepare_sources_reutiliza_particiones_y_versiona_cambios(
+    tmp_path, monkeypatch
+):
+    from src.core.configuracion import discovery
+    from src.core.dataset.experiment import prepare_sources
     from src.core.utils.paths import ProjectPaths
 
-    data_roots = {"original": tmp_path / "original", "complementario": tmp_path / "complementario"}
+    paths = ProjectPaths(tmp_path / "repo")
+    data_root = paths.root / "data"
+
+    source_names = ("original", "complementario")
+
+    data_roots = {
+        name: data_root / name
+        for name in source_names
+    }
+
     for source_idx, (source_name, root) in enumerate(data_roots.items()):
         for class_idx, class_name in enumerate(("A", "B", "C")):
             class_dir = root / class_name
             class_dir.mkdir(parents=True)
+
             for image_idx in range(12):
                 _write_rgb_image(
                     class_dir / f"{image_idx:03d}.jpg",
-                    seed=1000 + source_idx * 1000 + class_idx * 100 + image_idx,
+                    seed=1000 + source_idx * 1000
+                    + class_idx * 100 + image_idx,
                 )
+
+    sources = {
+        name: {
+            "path": f"data/{name}",
+            "deduplicate_exact_duplicates": True,
+        }
+        for name in source_names
+    }
+
+    scenarios = {
+        "ambas": {
+            "sources": list(source_names),
+        }
+    }
+
+    monkeypatch.setattr(
+        discovery,
+        "cargar_catalogos",
+        lambda: (sources, scenarios),
+    )
+
+    monkeypatch.setattr(
+        discovery,
+        "cargar_clases",
+        lambda: ("A", "B", "C"),
+    )
+
     config = ExperimentConfig(
-        model=ModelSpec("unit_test", "unit_test_arch", "test", pretrained=False),
+        model=ModelSpec(
+            "unit_test",
+            "unit_test_arch",
+            "test",
+            pretrained=False,
+        ),
         class_names=("A", "B", "C"),
         split_seed=17,
     )
-    paths = ProjectPaths(tmp_path / "repo")
-    overrides = {name: path for name, path in data_roots.items()}
+
     first = prepare_sources(
         paths,
         config,
-        requested_sources=SOURCE_NAMES,
-        path_overrides=overrides,
+        requested_sources=source_names,
         create_missing_splits=True,
     )
+
     second = prepare_sources(
         paths,
         config,
-        requested_sources=SOURCE_NAMES,
-        path_overrides=overrides,
+        requested_sources=source_names,
         create_missing_splits=False,
     )
-    for name in SOURCE_NAMES:
+
+    for name in source_names:
         assert first[name].split_path == second[name].split_path
         assert first[name].split == second[name].split
         assert first[name].split_path.is_file()
 
     old_path = first["original"].split_path
-    _write_rgb_image(data_roots["original"] / "A" / "000.jpg", seed=987654)
+
+    _write_rgb_image(
+        data_roots["original"] / "A" / "000.jpg",
+        seed=987654,
+    )
+
     changed = prepare_sources(
         paths,
         config,
-        requested_sources=SOURCE_NAMES,
-        path_overrides=overrides,
+        requested_sources=source_names,
         create_missing_splits=True,
     )
+
     assert changed["original"].split_path != old_path
     assert old_path.is_file()
     assert changed["original"].split_path.is_file()
+
+
 
 
 def test_dataset_excluye_duplicados_exactos_sin_borrar_archivos(tmp_path):
@@ -377,4 +430,3 @@ def test_dataset_rechaza_mismo_contenido_en_clases_distintas_entre_fuentes(
             source_names=("original", "complementario"),
             deduplicate_exact_duplicates=False,
         )
-"""

@@ -220,7 +220,7 @@ def entrenar(
     metadata: dict | None = None,
 ):
     model = crear_modelo(
-        architecture=config.model.architecture,
+        arquitectura=config.model.architecture,
         num_classes=config.num_classes,
         pretrained=config.model.pretrained,
     )

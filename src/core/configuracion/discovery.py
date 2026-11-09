@@ -286,7 +286,12 @@ def get_dataset_catalog(
     *,
     refresh: bool = False,
 ) -> dict:
-    """Devuelve el catálogo detectado; se calcula una vez por proceso/root."""
+    """Devuelve el catálogo detectado; permite refrescarlo tras agregar datasets.
+
+    El catálogo se cachea para evitar escanear todas las imágenes en cada
+    consulta. La interfaz puede solicitar refresh=True cuando el usuario
+    incorpora una nueva carpeta de datos.
+    """
     root_text = str(Path(project_root).expanduser().resolve())
     if refresh:
         _cached_dataset_catalog.cache_clear()
