@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader
 
 from src.core.configuracion.settings import ExperimentConfig
 from src.core.dataset.transforms import build_eval_transform
+from src.core.dataset.preprocessing import ImagePreprocessor
 from src.core.experimentos.schemas import RunRecord
 from src.core.experimentos.service import ExperimentService
 from src.core.modelos.factory import crear_modelo
@@ -365,6 +366,7 @@ def evaluar_ejecucion(
     model.eval()
 
     transform = build_eval_transform(config=config)
+    preprocessor = ImagePreprocessor(config.preprocessing_pipeline, config.preprocessing_options)
 
     tests: dict[str, dict] = {}
     external_evaluations: dict[str, dict] = {}
@@ -379,6 +381,7 @@ def evaluar_ejecucion(
                 prepared[name],
                 "test",
                 transform,
+                preprocessor,
             )
             partition = "test"
 
@@ -386,6 +389,7 @@ def evaluar_ejecucion(
             dataset = full_dataset_for(
                 prepared[name],
                 transform,
+                preprocessor,
             )
             partition = "full"
 

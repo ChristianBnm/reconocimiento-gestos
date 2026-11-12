@@ -85,6 +85,8 @@ class ExperimentConfig:
     normalization_mean: tuple[float, float, float] = (0.485, 0.456, 0.406)
     normalization_std: tuple[float, float, float] = (0.229, 0.224, 0.225)
     device: Literal["auto", "cpu", "cuda"] = "auto"
+    preprocessing_pipeline: str = "rgb"
+    preprocessing_options: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.class_names:
@@ -114,6 +116,10 @@ class ExperimentConfig:
             raise ValueError("La normalización debe tener tres canales RGB.")
         if any(value <= 0 for value in self.normalization_std):
             raise ValueError("Los valores de desviación estándar deben ser positivos.")
+        if self.preprocessing_pipeline not in {"rgb", "mediapipe_roi", "mediapipe_roi_normalized", "mediapipe_roi_canny", "mediapipe_roi_rgb_edges", "yolo_roi"}:
+            raise ValueError("preprocessing_pipeline no reconocido.")
+        if not isinstance(self.preprocessing_options, dict):
+            raise ValueError("preprocessing_options debe ser un objeto.")
         if self.device not in {"auto", "cpu", "cuda"}:
             raise ValueError(
         "device debe ser 'auto', 'cpu' o 'cuda'."

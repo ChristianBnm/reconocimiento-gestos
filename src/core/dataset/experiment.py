@@ -336,6 +336,7 @@ def subset_for(
     source: PreparedSource,
     partition: str,
     transform=None,
+    preprocessor=None,
 ) -> DatasetSubset:
     if partition not in {"train", "val", "test"}:
         raise ValueError(f"Partición desconocida: {partition}")
@@ -349,15 +350,18 @@ def subset_for(
         source.dataset,
         getattr(source.split, partition),
         transform,
+        preprocessor,
     )
 
 def full_dataset_for(
     source: PreparedSource,
     transform=None,
+    preprocessor=None,
 ) -> DatasetSubset:
     """Devuelve la fuente completa, sin aplicar particiones internas."""
     return DatasetSubset(
         source.dataset,
         range(len(source.dataset)),
         transform,
+        preprocessor,
     )

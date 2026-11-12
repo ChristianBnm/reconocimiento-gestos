@@ -1,4 +1,5 @@
 data/
+dataset_depurado_sin_duplicados_exactos/
 checkpoints/
 results/
 __pycache__/

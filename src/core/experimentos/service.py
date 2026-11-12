@@ -37,6 +37,7 @@ from src.core.dataset.transforms import (
     build_eval_transform,
     build_train_transform,
 )
+from src.core.dataset.preprocessing import ImagePreprocessor
 from src.core.entrenamiento.trainer import Trainer, TrainingCancelled
 from src.core.experimentos.registry import ExperimentRegistry
 from src.core.experimentos.schemas import (
@@ -389,15 +390,18 @@ class ExperimentService:
 
             config = adaptar_normalizacion_a_modelo(config, model)
 
+            preprocessor = ImagePreprocessor(
+                config.preprocessing_pipeline, config.preprocessing_options
+            )
             train_transform = build_train_transform(config=config)
             eval_transform = build_eval_transform(config=config)
 
             train_parts = [
-                subset_for(prepared[name], "train", train_transform)
+                subset_for(prepared[name], "train", train_transform, preprocessor)
                 for name in source_names
             ]
             val_parts = [
-                subset_for(prepared[name], "val", eval_transform)
+                subset_for(prepared[name], "val", eval_transform, preprocessor)
                 for name in source_names
             ]
 
@@ -431,6 +435,8 @@ class ExperimentService:
                 "experiment_id": spec.experiment_id,
                 "run_id": run_id,
                 "model_name": spec.model_name,
+                "preprocessing_pipeline": config.preprocessing_pipeline,
+                "preprocessing_options": config.preprocessing_options,
                 "training_sources": source_names,
                 "dataset_roles": {item.source_name: item.role for item in active_assignments},
                 "source_paths": {

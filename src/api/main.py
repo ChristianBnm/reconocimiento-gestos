@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from src.api.dependencies import PROJECT_ROOT, recover_interrupted_runs
-from src.api.routes import evaluation, experiments, health, models, runs, sources
+from src.api.routes import evaluation, experiments, health, models, runs, sources, prediction
 from src.core.configuracion.discovery import get_dataset_catalog
 
 
@@ -29,3 +29,4 @@ app.include_router(sources.router)
 app.include_router(experiments.router)
 app.include_router(runs.router)
 app.include_router(evaluation.router)
+app.include_router(prediction.router)

@@ -84,6 +84,8 @@ const INITIAL_FORM = {
   patience: 5,
   seed: 42,
   freeze_backbone: true,
+  preprocessing_pipeline: "rgb",
+  preprocessing_options: { roi_margin: 0.2, min_detection_confidence: 0.5, confidence: 0.25, canny_low: 100, canny_high: 200, edge_blend: 0.35, weights: "" },
   train_percent: 70,
   validation_percent: 15,
   test_percent: 15,
@@ -114,6 +116,11 @@ function App() {
   const [selectedEvaluation, setSelectedEvaluation] = useState(null);
   const [selectedTestKey, setSelectedTestKey] = useState("original");
   const [evaluationError, setEvaluationError] = useState("");
+  const [predictionFile, setPredictionFile] = useState(null);
+  const [predictionPreview, setPredictionPreview] = useState("");
+  const [predictionResult, setPredictionResult] = useState(null);
+  const [predictionLoading, setPredictionLoading] = useState(false);
+  const [predictionError, setPredictionError] = useState("");
 
 
   const [form, setForm] = useState(INITIAL_FORM);
@@ -340,6 +347,11 @@ function App() {
     return;
   }
 
+  if (form.preprocessing_pipeline === "yolo_roi" && !form.preprocessing_options.weights.trim()) {
+    setFormError("Indicá la ruta de los pesos YOLO entrenados para detectar manos.");
+    return;
+  }
+
   if (form.datasets.length === 0) {
     setFormError("Asigná al menos un dataset.");
     return;
@@ -450,6 +462,8 @@ const payload = {
     patience: Number(form.patience),
     seed: Number(form.seed),
     freeze_backbone: form.freeze_backbone,
+    preprocessing_pipeline: form.preprocessing_pipeline,
+    preprocessing_options: form.preprocessing_options,
     train_size: trainPercent / 100,
     val_size: validationPercent / 100,
     test_size: testPercent / 100,
@@ -576,6 +590,37 @@ const payload = {
     setEvaluatingRunId(null);
   }
 }
+
+  async function predictExternalImage() {
+    if (!selectedEvaluation?.runId || !predictionFile) return;
+    setPredictionLoading(true);
+    setPredictionError("");
+    setPredictionResult(null);
+    try {
+      const response = await fetch(
+        `${API}/runs/${encodeURIComponent(selectedEvaluation.runId)}/predict`,
+        { method: "POST", headers: { "Content-Type": predictionFile.type }, body: predictionFile }
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const detail = typeof payload?.detail === "string" ? payload.detail : `Error HTTP ${response.status}`;
+        throw new Error(detail);
+      }
+      setPredictionResult(payload);
+    } catch (err) {
+      setPredictionError(err.message);
+    } finally {
+      setPredictionLoading(false);
+    }
+  }
+
+  function choosePredictionFile(event) {
+    const file = event.target.files?.[0] ?? null;
+    setPredictionFile(file);
+    setPredictionResult(null);
+    setPredictionError("");
+    setPredictionPreview(file ? URL.createObjectURL(file) : "");
+  }
 
   async function cancelRun(run) {
     if (!run?.run_id || !ACTIVE_RUN_STATUSES.has(run.status)) return;
@@ -923,7 +968,89 @@ const payload = {
                   </p>
                 </div>
 
-                                <div className="form-full">
+                                <div className="form-full preprocessing-section">
+                  <h3>Transformación de imágenes</h3>
+                  <p>Se aplica antes de las transformaciones de entrenamiento y de forma determinista en validation, test y evaluación externa. La opción predeterminada conserva el flujo RGB actual.</p>
+                  <label>
+                    Pipeline de procesamiento
+                    <select
+                      name="preprocessing_pipeline"
+                      value={form.preprocessing_pipeline}
+                      onChange={updateForm}
+                    >
+                      <option value="rgb">Ninguna — RGB original</option>
+                      <option value="mediapipe_roi">MediaPipe — detección y ROI</option>
+                      <option value="mediapipe_roi_normalized">MediaPipe — ROI + normalización</option>
+                      <option value="mediapipe_roi_canny">MediaPipe — ROI + Canny</option>
+                      <option value="mediapipe_roi_rgb_edges">MediaPipe — ROI + RGB y bordes</option>
+                      <option value="yolo_roi">YOLO — detección y ROI</option>
+                    </select>
+                  </label>
+                  {form.preprocessing_pipeline !== "rgb" && (
+                    <div className="form-grid preprocessing-options">
+                      {form.preprocessing_pipeline.startsWith("mediapipe_") && (
+                        <>
+                          <label>
+                            Confianza mínima de detección
+                            <input type="number" min="0.1" max="1" step="0.05"
+                              value={form.preprocessing_options.min_detection_confidence}
+                              onChange={(event) => setForm((current) => ({ ...current, preprocessing_options: { ...current.preprocessing_options, min_detection_confidence: Number(event.target.value) } }))}
+                            />
+                          </label>
+                          <label>
+                            Margen del ROI (0 a 2)
+                            <input type="number" min="0" max="2" step="0.05"
+                              value={form.preprocessing_options.roi_margin}
+                              onChange={(event) => setForm((current) => ({ ...current, preprocessing_options: { ...current.preprocessing_options, roi_margin: Number(event.target.value) } }))}
+                            />
+                          </label>
+                        </>
+                      )}
+                      {form.preprocessing_pipeline === "yolo_roi" && (
+                        <>
+                          <label className="form-full">
+                            Ruta del modelo YOLO de detección de manos
+                            <input type="text" placeholder="Ej. models/hand_detector.pt"
+                              value={form.preprocessing_options.weights}
+                              onChange={(event) => setForm((current) => ({ ...current, preprocessing_options: { ...current.preprocessing_options, weights: event.target.value } }))}
+                            />
+                          </label>
+                          <label>
+                            Confianza mínima
+                            <input type="number" min="0.01" max="1" step="0.05"
+                              value={form.preprocessing_options.confidence}
+                              onChange={(event) => setForm((current) => ({ ...current, preprocessing_options: { ...current.preprocessing_options, confidence: Number(event.target.value) } }))}
+                            />
+                          </label>
+                        </>
+                      )}
+                      {form.preprocessing_pipeline.includes("canny") && (
+                        <>
+                          <label>Umbral Canny inferior
+                            <input type="number" min="0" max="255" value={form.preprocessing_options.canny_low}
+                              onChange={(event) => setForm((current) => ({ ...current, preprocessing_options: { ...current.preprocessing_options, canny_low: Number(event.target.value) } }))}
+                            />
+                          </label>
+                          <label>Umbral Canny superior
+                            <input type="number" min="0" max="255" value={form.preprocessing_options.canny_high}
+                              onChange={(event) => setForm((current) => ({ ...current, preprocessing_options: { ...current.preprocessing_options, canny_high: Number(event.target.value) } }))}
+                            />
+                          </label>
+                        </>
+                      )}
+                      {form.preprocessing_pipeline === "mediapipe_roi_rgb_edges" && (
+                        <label>Intensidad de bordes (0 a 1)
+                          <input type="number" min="0" max="1" step="0.05" value={form.preprocessing_options.edge_blend}
+                            onChange={(event) => setForm((current) => ({ ...current, preprocessing_options: { ...current.preprocessing_options, edge_blend: Number(event.target.value) } }))}
+                          />
+                        </label>
+                      )}
+                    </div>
+                  )}
+                  <p className="form-note">Los detectores deben estar instalados y configurados en el backend. Si no se detecta una mano, la ejecución registra el error y no sustituye silenciosamente la imagen original. YOLO requiere pesos entrenados para detectar manos.</p>
+                </div>
+
+                <div className="form-full">
                   <h3>Distribución del dataset de entrenamiento</h3>
 
                   <p>
@@ -1437,23 +1564,44 @@ const payload = {
         {selectedEvaluation && (() => {
             const result = selectedEvaluation.results;
 
-            // Evaluaciones agrupadas por fuente de datos.
+            // Unificar las fuentes internas y externas solo para su visualización.
+            // Los resultados siguen separados en el JSON y se identifican por rol.
             const tests = result?.tests ?? {};
-            const testKeys = Object.keys(tests);
+            const externalEvaluations = result?.external_evaluations ?? {};
+            const evaluationOptions = [
+                ...Object.entries(tests).map(([sourceName, data]) => ({
+                    id: `internal:${sourceName}`,
+                    sourceName,
+                    role: data?.role ?? "final_test",
+                    data,
+                })),
+                ...Object.entries(externalEvaluations).map(([sourceName, data]) => ({
+                    id: `external:${sourceName}`,
+                    sourceName,
+                    role: data?.role ?? "external_eval",
+                    data,
+                })),
+            ];
 
-            // Usar la fuente seleccionada si existe.
-            // Si no existe, seleccionar la primera disponible.
-            const activeTestKey = tests[selectedTestKey]
-                ? selectedTestKey
-                : testKeys[0];
-
-            const test = activeTestKey ? tests[activeTestKey] : null;
+            // Mantener la selección cuando existe; si no, elegir la primera fuente.
+            const activeEvaluation =
+                evaluationOptions.find((item) => item.id === selectedTestKey) ??
+                evaluationOptions[0] ??
+                null;
+            const activeTestKey = activeEvaluation?.sourceName ?? null;
+            const test = activeEvaluation?.data ?? null;
+            const roleLabel = activeEvaluation?.role === "external_eval"
+                ? "Evaluación externa"
+                : activeEvaluation?.role === "train_source"
+                  ? "Test interno"
+                  : "Prueba final";
             const metrics = test?.metrics ?? {};
             const matrix = test?.confusion_matrix ?? [];
             const classNames = Object.keys(test?.per_class ?? {});
 
             const resources = [
                 ["Fuente evaluada", activeTestKey ?? "—"],
+                ["Tipo de evaluación", roleLabel],
                 ["Modelo", result?.model ?? "—"],
                 ["Arquitectura", result?.architecture ?? "—"],
                 ["Dispositivo solicitado", result?.requested_device ?? "—"],
@@ -1508,14 +1656,14 @@ const payload = {
                             className="secondary-button"
                             onClick={() => {
                                 setSelectedEvaluation(null);
-                                setSelectedTestKey("original");
+                                setSelectedTestKey("");
                             }}
                         >
                             Cerrar
                         </button>
                     </div>
 
-                    {testKeys.length > 0 ? (
+                    {evaluationOptions.length > 0 ? (
                         <>
                             <div className="evaluation-details">
                                 <label htmlFor="evaluation-source">
@@ -1524,20 +1672,22 @@ const payload = {
 
                                 <select
                                     id="evaluation-source"
-                                    value={activeTestKey ?? ""}
+                                    value={activeEvaluation?.id ?? ""}
                                     onChange={(event) =>
                                         setSelectedTestKey(event.target.value)
                                     }
                                 >
-                                    {testKeys.map((key) => (
-                                        <option key={key} value={key}>
-                                            {key}
+                                    {evaluationOptions.map((item) => (
+                                        <option key={item.id} value={item.id}>
+                                            {item.role === "external_eval"
+                                                ? `Externa · ${item.sourceName}`
+                                                : `Interna · ${item.sourceName}`}
                                         </option>
                                     ))}
                                 </select>
 
                                 <p className="resource-detail">
-                                    Partición: {test?.partition ?? "—"} ·
+                                    Tipo: {roleLabel} · Partición: {test?.partition ?? "—"} ·
                                     {" "}Muestras: {test?.num_samples ?? "—"}
                                 </p>
                             </div>
@@ -1664,12 +1814,58 @@ const payload = {
                                         </div>
                                     ))}
                                 </div>
+
+                                <h3>Predicción con imagen externa</h3>
+                                <p className="resource-detail">
+                                  Cargá una imagen JPG o PNG ajena a los datasets. Se utilizará el checkpoint y el preprocesamiento de esta ejecución.
+                                </p>
+                                <div className="prediction-panel">
+                                  <div className="prediction-upload">
+                                    <label className="prediction-file-label">
+                                      Seleccionar imagen
+                                      <input type="file" accept="image/png,image/jpeg,.jpg,.jpeg,.png" onChange={choosePredictionFile} />
+                                    </label>
+                                    <button type="button" className="primary-button"
+                                      onClick={predictExternalImage}
+                                      disabled={!predictionFile || predictionLoading}>
+                                      {predictionLoading ? "Prediciendo..." : "Predecir imagen"}
+                                    </button>
+                                  </div>
+                                  {predictionPreview && (
+                                    <img className="prediction-preview" src={predictionPreview} alt="Vista previa de imagen externa" />
+                                  )}
+                                  {predictionError && <div className="error-banner" role="alert">{predictionError}</div>}
+                                  {predictionResult && (
+                                    <div className="prediction-result">
+                                      <div>
+                                        <span className="stat-label">Clase predicha</span>
+                                        <strong className="prediction-class">{predictionResult.predicted_class}</strong>
+                                        <span className="resource-detail">Confianza: {(predictionResult.confidence * 100).toFixed(2)}%</span>
+                                      </div>
+                                      <div className="prediction-meta">
+                                        <span>Modelo: <strong>{predictionResult.model ?? predictionResult.architecture}</strong></span>
+                                        <span>Dispositivo: <strong>{predictionResult.device}</strong></span>
+                                        <span>Inferencia: <strong>{predictionResult.inference_time_ms} ms</strong></span>
+                                        <span>Pipeline: <strong>{predictionResult.preprocessing_pipeline}</strong></span>
+                                      </div>
+                                      <div className="prediction-top">
+                                        <strong>Alternativas más probables</strong>
+                                        {predictionResult.top_predictions?.map((item) => (
+                                          <div className="prediction-row" key={item.class_name}>
+                                            <span>{item.class_name}</span>
+                                            <span>{(item.probability * 100).toFixed(2)}%</span>
+                                          </div>
+                                        ))}
+                                      </div>
+                                    </div>
+                                  )}
+                                </div>
                             </div>
                         </>
                     ) : (
                         <p className="resource-detail">
-                            La API no devolvió evaluaciones agrupadas por fuente
-                            en result.tests. Revisá la estructura de la respuesta
+                            La API no devolvió evaluaciones en result.tests ni
+                            result.external_evaluations. Revisá la estructura de la respuesta
                             del endpoint /results.
                         </p>
                     )}

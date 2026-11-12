@@ -226,12 +226,13 @@ class GestosDataset(Dataset):
 class DatasetSubset(Dataset):
     """Vista de un dataset a partir de índices, con transformación propia."""
 
-    def __init__(self, dataset: GestosDataset, indices: Iterable[int], transformacion=None):
+    def __init__(self, dataset: GestosDataset, indices: Iterable[int], transformacion=None, preprocesador=None):
         self.dataset = dataset
         self.indices = [int(index) for index in indices]
         if any(index < 0 or index >= len(dataset) for index in self.indices):
             raise IndexError("El subset contiene índices fuera del rango del dataset.")
         self.transformacion = transformacion
+        self.preprocesador = preprocesador
 
     def __len__(self) -> int:
         return len(self.indices)
@@ -240,6 +241,15 @@ class DatasetSubset(Dataset):
         original_index = self.indices[index]
         image = self.dataset.load_image(original_index)
         label = self.dataset.records[original_index].label
+        if self.preprocesador is not None:
+            try:
+                image = self.preprocesador(image)
+            except Exception as exc:
+                record = self.dataset.records[original_index]
+                raise RuntimeError(
+                    f"Falló el preprocesamiento {getattr(self.preprocesador, 'pipeline', 'seleccionado')} "
+                    f"en {record.relative_path}: {exc}"
+                ) from exc
         if self.transformacion is not None:
             transformed = self.transformacion(image=image)
             image = transformed["image"] if isinstance(transformed, dict) else transformed
