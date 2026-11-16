@@ -9,6 +9,7 @@ import torch
 from src.core.configuracion.settings import ExperimentConfig
 from src.core.modelos.factory import crear_modelo, congelar_backbone, descongelar_modelo
 from src.core.utils.io import save_json
+from src.core.utils.debug_trace import trace, trace_exception
 
 
 class TrainingCancelled(Exception):
@@ -101,6 +102,8 @@ class Trainer:
             raise TrainingCancelled("El usuario solicitó detener el entrenamiento.")
 
     def _run_epoch(self, loader, training: bool) -> tuple[float, float]:
+        phase = "train" if training else "validation"
+        trace("epoch.phase.begin", phase=phase, batches=len(loader))
         if len(loader) == 0:
             raise ValueError("El DataLoader de entrenamiento/validación está vacío.")
         if training and self.config.freeze_backbone:
@@ -116,7 +119,12 @@ class Trainer:
         total = 0
         context = torch.enable_grad() if training else torch.no_grad()
         with context:
-            for images, labels in loader:
+            for batch_index, (images, labels) in enumerate(loader, start=1):
+                if batch_index == 1:
+                    trace("epoch.first_batch.loaded", phase=phase,
+                          batch_size=int(labels.size(0)), image_shape=tuple(images.shape))
+                if batch_index == len(loader):
+                    trace("epoch.last_batch.loaded", phase=phase, batch=batch_index)
                 self._raise_if_cancelled()
                 images = images.to(self.device, non_blocking=True)
                 labels = labels.to(self.device, non_blocking=True)
@@ -140,6 +148,8 @@ class Trainer:
                 total_loss += float(loss.item()) * batch_size
                 correct += int((logits.argmax(dim=1) == labels).sum().item())
                 total += batch_size
+        trace("epoch.phase.end", phase=phase, samples=total,
+              loss=total_loss / total, accuracy=correct / total)
         return total_loss / total, correct / total
 
     def train_epoch(self) -> tuple[float, float]:
@@ -175,6 +185,7 @@ class Trainer:
 
         for epoch in range(1, self.config.epochs + 1):
             self._raise_if_cancelled()
+            trace("epoch.begin", epoch=epoch, total_epochs=self.config.epochs)
             epoch_started = time.perf_counter()
             train_loss, train_accuracy = self.train_epoch()
             val_loss, val_accuracy = self.validate_epoch()
@@ -189,6 +200,8 @@ class Trainer:
             }
             history.append(record)
             save_json(history, self.history_path)
+            trace("epoch.metrics_saved", epoch=epoch, metrics=record,
+                  history_path=self.history_path)
             print(
                 f"Época {epoch}/{self.config.epochs} | "
                 f"Train loss={train_loss:.4f} acc={train_accuracy:.4f} | "

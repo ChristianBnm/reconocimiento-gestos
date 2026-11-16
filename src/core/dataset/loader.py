@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 from torch.utils.data import Dataset
 
-from src.core.configuracion.settings import CLASS_NAMES
+from src.core.configuracion.settings import ordenar_clases
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
@@ -69,7 +69,28 @@ class GestosDataset(Dataset):
             if not root.is_dir():
                 raise NotADirectoryError(f"No es una carpeta: {root}")
 
-        names = tuple(class_names) if class_names is not None else CLASS_NAMES
+        if class_names is not None:
+            names = tuple(class_names)
+        else:
+            discovered = []
+            for root in roots:
+                labels = [
+                    child.name for child in root.iterdir()
+                    if child.is_dir() and not child.name.startswith(".")
+                    and any(
+                        item.is_file() and item.suffix.casefold() in IMAGE_EXTENSIONS
+                        for item in child.iterdir()
+                    )
+                ]
+                discovered.append(set(labels))
+            if not discovered or not discovered[0]:
+                raise ValueError("No se encontraron clases con imágenes en el dataset.")
+            if any(labels != discovered[0] for labels in discovered[1:]):
+                raise ValueError(
+                    "Las fuentes tienen vocabularios distintos. "
+                    "Definí explícitamente class_names para unificar las etiquetas."
+                )
+            names = ordenar_clases(discovered[0])
 
         if not names or len(set(names)) != len(names):
             raise ValueError("class_names debe ser una secuencia no vacía y sin duplicados.")
@@ -118,7 +139,7 @@ class GestosDataset(Dataset):
                 raise ValueError(
                     f"La fuente {root} contiene carpetas con imágenes que no están en el vocabulario: "
                     + ", ".join(sorted(unknown_dirs))
-                    + ". Agregá las etiquetas a clases.json o mové esas carpetas fuera del dataset."
+                    + ". Verificá el vocabulario detectado y las carpetas de clase."
                 )
 
 
@@ -200,7 +221,7 @@ class GestosDataset(Dataset):
             raise ValueError(
                 "No se encontraron imágenes para estas clases configuradas: "
                 + ", ".join(missing)
-                + ". Revisá clases.json y la estructura del dataset."
+                + ". Verificá el vocabulario detectado y las carpetas de clase."
             )
         return records
 
@@ -226,22 +247,37 @@ class GestosDataset(Dataset):
 class DatasetSubset(Dataset):
     """Vista de un dataset a partir de índices, con transformación propia."""
 
-    def __init__(self, dataset: GestosDataset, indices: Iterable[int], transformacion=None, preprocesador=None):
+    def __init__(self, dataset: GestosDataset, indices: Iterable[int], transformacion=None, preprocesador=None, cached_paths: dict[int, Path] | None = None, roi_boxes: dict[int, tuple[int, int, int, int]] | None = None):
         self.dataset = dataset
         self.indices = [int(index) for index in indices]
         if any(index < 0 or index >= len(dataset) for index in self.indices):
             raise IndexError("El subset contiene índices fuera del rango del dataset.")
         self.transformacion = transformacion
         self.preprocesador = preprocesador
+        # cached_paths se conserva por compatibilidad con ejecuciones antiguas.
+        self.cached_paths = {int(key): Path(value) for key, value in (cached_paths or {}).items()}
+        self.roi_boxes = {int(key): tuple(value) for key, value in (roi_boxes or {}).items()}
 
     def __len__(self) -> int:
         return len(self.indices)
 
     def __getitem__(self, index: int):
         original_index = self.indices[index]
-        image = self.dataset.load_image(original_index)
+        cached_path = self.cached_paths.get(original_index)
+        roi_box = self.roi_boxes.get(original_index)
+        if cached_path is not None:
+            cached_bgr = cv2.imread(str(cached_path), cv2.IMREAD_COLOR)
+            if cached_bgr is None:
+                raise RuntimeError(f"No se pudo cargar la ROI en caché: {cached_path}")
+            image = cv2.cvtColor(cached_bgr, cv2.COLOR_BGR2RGB)
+        else:
+            image = self.dataset.load_image(original_index)
+            if roi_box is not None:
+                if self.preprocesador is None or not hasattr(self.preprocesador, "apply_mediapipe_box"):
+                    raise RuntimeError("Hay coordenadas ROI pero falta un preprocesador MediaPipe compatible.")
+                image = self.preprocesador.apply_mediapipe_box(image, roi_box)
         label = self.dataset.records[original_index].label
-        if self.preprocesador is not None:
+        if self.preprocesador is not None and cached_path is None and roi_box is None:
             try:
                 image = self.preprocesador(image)
             except Exception as exc:

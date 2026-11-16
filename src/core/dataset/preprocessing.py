@@ -33,6 +33,7 @@ class ImagePreprocessor:
                 raise RuntimeError("El pipeline MediaPipe requiere instalar mediapipe en el backend.") from exc
             self._hands = mp.solutions.hands.Hands(
                 static_image_mode=True, max_num_hands=1,
+                model_complexity=int(self.options.get("model_complexity", 1)),
                 min_detection_confidence=float(self.options.get("min_detection_confidence", 0.5)),
             )
         elif self.pipeline == "yolo_roi":
@@ -64,7 +65,10 @@ class ImagePreprocessor:
             raise RuntimeError("El detector produjo un recorte vacío.")
         return roi
 
-    def _mediapipe_roi(self, image: np.ndarray) -> np.ndarray:
+    def detect_mediapipe_box(self, image: np.ndarray) -> tuple[int, int, int, int]:
+        """Detecta la mano y devuelve la ROI expandida en coordenadas de la imagen original."""
+        if self._hands is None:
+            raise RuntimeError("El preprocesador no tiene MediaPipe inicializado.")
         result = self._hands.process(image)
         if not result.multi_hand_landmarks:
             raise RuntimeError("MediaPipe no detectó ninguna mano en la imagen.")
@@ -74,24 +78,29 @@ class ImagePreprocessor:
                max(0, int(min(p.y for p in points) * height)),
                min(width, int(max(p.x for p in points) * width) + 1),
                min(height, int(max(p.y for p in points) * height) + 1))
-        return self._crop_roi(image, box)
+        # Guardamos la caja ya expandida para no recalcularla durante cada época.
+        x1, y1, x2, y2 = box
+        margin = float(self.options.get("roi_margin", 0.20))
+        if not 0 <= margin <= 2:
+            raise ValueError("roi_margin debe estar entre 0 y 2.")
+        pad_x, pad_y = int((x2 - x1) * margin), int((y2 - y1) * margin)
+        expanded = (max(0, x1-pad_x), max(0, y1-pad_y),
+                    min(width, x2+pad_x), min(height, y2+pad_y))
+        if expanded[2] <= expanded[0] or expanded[3] <= expanded[1]:
+            raise RuntimeError("El detector produjo una región ROI inválida.")
+        return expanded
 
-    def _yolo_roi(self, image: np.ndarray) -> np.ndarray:
-        results = self._yolo.predict(
-            source=image, conf=float(self.options.get("confidence", 0.25)),
-            verbose=False, imgsz=int(self.options.get("input_size", 640)),
-        )
-        boxes = results[0].boxes
-        if boxes is None or len(boxes) == 0:
-            raise RuntimeError("YOLO no detectó ninguna mano en la imagen.")
-        best = int(boxes.conf.argmax().item())
-        coords = boxes.xyxy[best].detach().cpu().numpy().astype(int)
-        return self._crop_roi(image, tuple(coords.tolist()))
+    def apply_mediapipe_box(self, image: np.ndarray, box: tuple[int, int, int, int]) -> np.ndarray:
+        """Recorta desde la imagen original y aplica los pasos posteriores a la ROI."""
+        roi = image[int(box[1]):int(box[3]), int(box[0]):int(box[2])]
+        if roi.size == 0:
+            raise RuntimeError("El recorte ROI guardado está vacío o fuera de la imagen.")
+        return self._postprocess_roi(roi)
 
-    def __call__(self, image: np.ndarray) -> np.ndarray:
-        if self.pipeline == "rgb":
-            return image
-        roi = self._mediapipe_roi(image) if self.pipeline.startswith("mediapipe_") else self._yolo_roi(image)
+    def _mediapipe_roi(self, image: np.ndarray) -> np.ndarray:
+        return self.apply_mediapipe_box(image, self.detect_mediapipe_box(image))
+
+    def _postprocess_roi(self, roi: np.ndarray) -> np.ndarray:
         if self.pipeline == "mediapipe_roi_normalized":
             lab = cv2.cvtColor(roi, cv2.COLOR_RGB2LAB)
             lightness, a, b = cv2.split(lab)
@@ -111,3 +120,21 @@ class ImagePreprocessor:
                     raise ValueError("edge_blend debe estar entre 0 y 1.")
                 roi = cv2.addWeighted(roi, 1.0 - alpha, edge_rgb, alpha, 0)
         return roi
+
+    def _yolo_roi(self, image: np.ndarray) -> np.ndarray:
+        results = self._yolo.predict(
+            source=image, conf=float(self.options.get("confidence", 0.25)),
+            verbose=False, imgsz=int(self.options.get("input_size", 640)),
+        )
+        boxes = results[0].boxes
+        if boxes is None or len(boxes) == 0:
+            raise RuntimeError("YOLO no detectó ninguna mano en la imagen.")
+        best = int(boxes.conf.argmax().item())
+        coords = boxes.xyxy[best].detach().cpu().numpy().astype(int)
+        return self._crop_roi(image, tuple(coords.tolist()))
+
+    def __call__(self, image: np.ndarray) -> np.ndarray:
+        if self.pipeline == "rgb":
+            return image
+        roi = self._mediapipe_roi(image) if self.pipeline.startswith("mediapipe_") else self._yolo_roi(image)
+        return self._postprocess_roi(roi) if self.pipeline.startswith("mediapipe_") else roi

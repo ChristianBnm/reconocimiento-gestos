@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Sequence
 
 from src.core.configuracion.catalogo import cargar_catalogos
-from src.core.configuracion.settings import cargar_clases
+from src.core.configuracion.settings import cargar_clases, ordenar_clases
 from src.core.dataset.loader import IMAGE_EXTENSIONS
 
 
@@ -67,7 +67,7 @@ def inspect_dataset_directory(
         names_by_casefold[key] = directory
 
     if expected_class_names is None:
-        class_names = tuple(directory.name for directory in class_dirs)
+        class_names = ordenar_clases(directory.name for directory in class_dirs)
     else:
         class_names = tuple(expected_class_names)
         if not class_names or len(set(class_names)) != len(class_names):
@@ -185,8 +185,6 @@ def _discover_uncached(project_root_text: str) -> dict:
     project_root = Path(project_root_text).resolve()
     data_root = project_root / "data"
     configured_sources, _ = cargar_catalogos()
-    default_classes = cargar_clases()
-
     valid_sources: list[dict] = []
     invalid_sources: list[dict] = []
     configured_paths: set[Path] = set()
@@ -197,13 +195,19 @@ def _discover_uncached(project_root_text: str) -> dict:
         configured_paths.add(dataset_path)
         known_names.add(source_name.casefold())
         try:
-            inspection = inspect_dataset_directory(dataset_path, default_classes)
+            inspection = inspect_dataset_directory(dataset_path)
+            class_file = _write_class_manifest(
+                project_root,
+                source_name,
+                dataset_path,
+                inspection["class_names"],
+            )
             valid_sources.append({
                 "name": source_name,
                 "path": dataset_path.relative_to(project_root).as_posix()
                 if dataset_path.is_relative_to(project_root) else str(dataset_path),
                 "description": definition.get("description", "Fuente configurada"),
-                "class_file": None,
+                "class_file": class_file,
                 "classes": list(inspection["class_names"]),
                 "num_classes": inspection["num_classes"],
                 "num_images": inspection["num_images"],

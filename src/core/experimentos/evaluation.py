@@ -16,6 +16,7 @@ from torch.utils.data import DataLoader
 from src.core.configuracion.settings import ExperimentConfig
 from src.core.dataset.transforms import build_eval_transform
 from src.core.dataset.preprocessing import ImagePreprocessor
+from src.core.dataset.mediapipe_cache import MEDIAPIPE_PIPELINES, prepare_mediapipe_cache
 from src.core.experimentos.schemas import RunRecord
 from src.core.experimentos.service import ExperimentService
 from src.core.modelos.factory import crear_modelo
@@ -371,6 +372,24 @@ def evaluar_ejecucion(
     tests: dict[str, dict] = {}
     external_evaluations: dict[str, dict] = {}
 
+    # Si el experimento usa MediaPipe, recuperar la misma auditoría y caché
+    # creada durante el entrenamiento. La función reutiliza los PNG existentes
+    # y conserva el split original.
+    mediapipe_cache = {}
+    mediapipe_summary = None
+    if config.preprocessing_pipeline in MEDIAPIPE_PIPELINES:
+        (
+            mediapipe_cache,
+            mediapipe_summary,
+            _mediapipe_audit_path,
+            _mediapipe_summary_path,
+        ) = prepare_mediapipe_cache(
+            prepared,
+            source_names,
+            preprocessor,
+            output_path.parent / "cache_mediapipe",
+        )
+
     criterion = nn.CrossEntropyLoss(reduction="sum")
 
     for assignment in source_assignments:
@@ -382,6 +401,10 @@ def evaluar_ejecucion(
                 "test",
                 transform,
                 preprocessor,
+                indices_override=getattr(
+                    prepared[name], "_mediapipe_test_indices", None
+                ),
+                roi_boxes=mediapipe_cache.get(name),
             )
             partition = "test"
 
@@ -390,8 +413,14 @@ def evaluar_ejecucion(
                 prepared[name],
                 transform,
                 preprocessor,
+                indices_override=(
+                    getattr(prepared[name], "_mediapipe_external_indices", None)
+                    if config.preprocessing_pipeline in MEDIAPIPE_PIPELINES
+                    else None
+                ),
+                roi_boxes=mediapipe_cache.get(name),
             )
-            partition = "full"
+            partition = "external" if config.preprocessing_pipeline in MEDIAPIPE_PIPELINES else "full"
 
         else:
             raise ValueError(
@@ -491,19 +520,51 @@ def evaluar_ejecucion(
             / support.sum().item()
         )
 
+        source_mediapipe_summary = None
+        if mediapipe_summary is not None:
+            summary_key = (
+                f"{name}:external"
+                if assignment.role in {"final_test", "external_eval"}
+                else f"{name}:test"
+            )
+            source_mediapipe_summary = mediapipe_summary.get(summary_key)
+
+        metrics = {
+            "loss": total_loss / total,
+            # Métricas del clasificador condicionadas a una ROI válida.
+            "accuracy": total_correct / total,
+            "precision_macro": precision.mean().item(),
+            "recall_macro": recall.mean().item(),
+            "f1_macro": f1.mean().item(),
+            "f1_weighted": weighted_f1,
+        }
+        if source_mediapipe_summary is not None:
+            original_count = int(source_mediapipe_summary["total"])
+            metrics["mediapipe_coverage"] = (
+                int(source_mediapipe_summary["detectadas"]) / original_count
+                if original_count else 0.0
+            )
+            # Las imágenes sin mano detectada cuentan como fallo del sistema
+            # completo, aunque no formen parte de las métricas del clasificador.
+            metrics["end_to_end_accuracy"] = (
+                total_correct / original_count if original_count else 0.0
+            )
+
         per_source = {
             "source": name,
             "role": assignment.role,
             "partition": partition,
             "num_samples": total,
-            "metrics": {
-                "loss": total_loss / total,
-                "accuracy": total_correct / total,
-                "precision_macro": precision.mean().item(),
-                "recall_macro": recall.mean().item(),
-                "f1_macro": f1.mean().item(),
-                "f1_weighted": weighted_f1,
-            },
+            "original_num_samples": (
+                int(source_mediapipe_summary["total"])
+                if source_mediapipe_summary is not None else total
+            ),
+            "excluded_by_mediapipe": (
+                int(source_mediapipe_summary["excluidas"])
+                if source_mediapipe_summary is not None else 0
+            ),
+            "mediapipe": source_mediapipe_summary,
+            "metrics": metrics,
             "per_class": {
                 class_name: {
                     "support": int(support[index].item()),
@@ -535,6 +596,7 @@ def evaluar_ejecucion(
         "num_classes": num_classes,
         "tests": tests,
         "external_evaluations": external_evaluations,
+        "mediapipe_summary": mediapipe_summary,
     }
 
     _guardar_json_atomico(

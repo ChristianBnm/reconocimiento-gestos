@@ -16,6 +16,8 @@ from src.core.dataset.split import (
     DatasetSplit, cargar_split, dataset_fingerprint, dividir_dataset, guardar_split
 )
 
+from src.core.utils.debug_trace import trace, trace_exception
+
 from src.core.dataset.global_inventory import (
     build_global_inventory,
     validate_global_preflight,
@@ -55,7 +57,10 @@ def prepare_sources(
     regenerate_splits: bool = False,
     source_assignments: Sequence | None = None,
 ) -> dict[str, PreparedSource]:
+    prep_started = __import__("time").perf_counter()
+    trace("prepare_sources.enter", sources=list(requested_sources), root=paths.root)
     source_definitions = get_source_definitions(paths.root)
+    trace("prepare_sources.catalog_loaded", sources=list(source_definitions))
     unknown = sorted(set(requested_sources) - set(source_definitions))
     if unknown:
         raise ValueError(f"Fuentes desconocidas o no válidas: {', '.join(unknown)}")
@@ -73,10 +78,13 @@ def prepare_sources(
             if assignment.role != "unused"
         ]
 
+        trace("global_inventory.begin", assignments=[a.to_dict() for a in inventory_assignments])
         inventory = build_global_inventory(
             assignments=inventory_assignments,
             class_names=config.class_names,
         )
+        trace("global_inventory.end", elapsed_seconds=round(__import__("time").perf_counter()-prep_started, 3),
+              excluded_training_copies=len(inventory.excluded_training_copies))
     else:
         inventory = None
 
@@ -134,6 +142,8 @@ def prepare_sources(
     prepared: dict[str, PreparedSource] = {}
 
     for name in requested_sources:
+        source_started = __import__("time").perf_counter()
+        trace("source.dataset_scan.begin", source=name, path=locations[name])
         dataset = GestosDataset(
             locations[name],
             transformacion=None,
@@ -146,7 +156,11 @@ def prepare_sources(
             excluded_paths=excluded_paths_by_source.get(name, set()),
         )
 
+        trace("source.dataset_scan.end", source=name, images=len(dataset),
+              duplicate_images=len(dataset.excluded_duplicates),
+              elapsed_seconds=round(__import__("time").perf_counter()-source_started, 3))
         fingerprint = dataset_fingerprint(dataset)
+        trace("source.fingerprint.end", source=name, fingerprint=fingerprint)
 
         split_config_path = paths.source_split_path(
             name,
@@ -176,6 +190,7 @@ def prepare_sources(
                         "Entrená primero o autorizá la creación de particiones."
                     )
 
+                trace("source.split.begin", source=name, images=len(dataset))
                 split = dividir_dataset(
                     dataset.etiquetas,
                     config.train_size,
@@ -197,8 +212,10 @@ def prepare_sources(
                     config.val_size,
                     config.test_size,
                 )
-
+                trace("source.split.created", source=name, train=len(split.train),
+                      val=len(split.val), test=len(split.test))
             else:
+                trace("source.split.load.begin", source=name, path=split_path)
                 split = cargar_split(
                     split_path,
                     dataset,
@@ -207,6 +224,8 @@ def prepare_sources(
                     val_size=config.val_size,
                     test_size=config.test_size,
                 )
+                trace("source.split.loaded", source=name, train=len(split.train),
+                      val=len(split.val), test=len(split.test))
 
         else:
             split = None
@@ -218,6 +237,8 @@ def prepare_sources(
             split,
             split_path,
         )
+        trace("source.ready", source=name, images=len(dataset),
+              elapsed_seconds=round(__import__("time").perf_counter()-source_started, 3))
 
         _validate_group_partition_consistency(
             prepared,
@@ -228,6 +249,8 @@ def prepare_sources(
             ),
         )
 
+    trace("prepare_sources.exit", sources=list(prepared),
+          elapsed_seconds=round(__import__("time").perf_counter()-prep_started, 3))
     return prepared
 
 
@@ -337,6 +360,9 @@ def subset_for(
     partition: str,
     transform=None,
     preprocessor=None,
+    indices_override: Sequence[int] | None = None,
+    cached_paths: Mapping[int, Path] | None = None,
+    roi_boxes: Mapping[int, tuple[int, int, int, int]] | None = None,
 ) -> DatasetSubset:
     if partition not in {"train", "val", "test"}:
         raise ValueError(f"Partición desconocida: {partition}")
@@ -346,22 +372,43 @@ def subset_for(
             f"La fuente '{source.name}' no tiene particiones internas."
         )
 
+    indices = (
+        indices_override
+        if indices_override is not None
+        else getattr(source.split, partition)
+    )
     return DatasetSubset(
         source.dataset,
-        getattr(source.split, partition),
+        indices,
         transform,
         preprocessor,
+        cached_paths=cached_paths,
+        roi_boxes=roi_boxes,
     )
 
 def full_dataset_for(
     source: PreparedSource,
     transform=None,
     preprocessor=None,
+    indices_override: Sequence[int] | None = None,
+    cached_paths: Mapping[int, Path] | None = None,
+    roi_boxes: Mapping[int, tuple[int, int, int, int]] | None = None,
 ) -> DatasetSubset:
-    """Devuelve la fuente completa, sin aplicar particiones internas."""
+    """Devuelve la fuente completa o el subconjunto válido, sin crear splits.
+
+    ``indices_override`` permite excluir imágenes sin detección MediaPipe y
+    ``roi_boxes`` evita volver a ejecutar el detector durante la evaluación.
+    """
+    indices = (
+        indices_override
+        if indices_override is not None
+        else range(len(source.dataset))
+    )
     return DatasetSubset(
         source.dataset,
-        range(len(source.dataset)),
+        indices,
         transform,
         preprocessor,
+        cached_paths=cached_paths,
+        roi_boxes=roi_boxes,
     )

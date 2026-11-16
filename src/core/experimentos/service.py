@@ -38,6 +38,7 @@ from src.core.dataset.transforms import (
     build_train_transform,
 )
 from src.core.dataset.preprocessing import ImagePreprocessor
+from src.core.dataset.mediapipe_cache import MEDIAPIPE_PIPELINES, prepare_mediapipe_cache
 from src.core.entrenamiento.trainer import Trainer, TrainingCancelled
 from src.core.experimentos.registry import ExperimentRegistry
 from src.core.experimentos.schemas import (
@@ -54,6 +55,7 @@ from src.core.modelos.factory import (
 from src.core.utils.io import save_json
 from src.core.utils.paths import ProjectPaths
 from src.core.utils.reproducibilidad import establecer_semilla
+from src.core.utils.debug_trace import trace, trace_exception
 
 
 class ExperimentService:
@@ -229,14 +231,34 @@ class ExperimentService:
         self,
         spec: ExperimentSpec,
     ) -> tuple[str, ...]:
-        if spec.class_file is None:
-            return cargar_clases()
+        class_file = spec.class_file
+        if class_file is None:
+            training_sources = [
+                item for item in spec.datasets if item.role == "train_source"
+            ]
+            if len(training_sources) != 1:
+                raise ValueError(
+                    "No se pudo resolver el vocabulario automáticamente: "
+                    "seleccioná una fuente de entrenamiento con class_file."
+                )
+            catalog = get_dataset_catalog(self.paths.root)
+            source = next(
+                (item for item in catalog["sources"]
+                 if item["name"] == training_sources[0].source_name),
+                None,
+            )
+            class_file = source.get("class_file") if source else None
+            if class_file is None:
+                # Compatibilidad con definiciones antiguas y rutas no catalogadas.
+                training_path = Path(training_sources[0].path).expanduser()
+                if not training_path.is_absolute():
+                    training_path = self.paths.root / training_path
+                inspection = inspect_dataset_directory(training_path)
+                return tuple(inspection["class_names"])
 
-        path = Path(spec.class_file).expanduser()
-
+        path = Path(class_file).expanduser()
         if not path.is_absolute():
             path = self.paths.root / path
-
         return cargar_clases(path)
 
 
@@ -318,11 +340,20 @@ class ExperimentService:
                     f"La ejecución {run_id!r} no está pendiente: {run.status!r}."
                 )
             self.registry.update_run_status(run_id, "running")
+            trace("run.started", run_id=run_id, experiment_id=experiment_id)
 
             spec = self.get_experiment(experiment_id)
+            trace("experiment.loaded", run_id=run_id, model=spec.model_name,
+                  assignments=[item.to_dict() for item in spec.datasets])
+            trace("validation.begin", run_id=run_id)
             self.validate_experiment(spec)
+            trace("validation.end", run_id=run_id)
             config = self._build_config(spec)
             device = self._resolve_device(config.device)
+            trace("config.ready", run_id=run_id, classes=list(config.class_names),
+                  num_classes=config.num_classes, image_size=config.image_size,
+                  batch_size=config.batch_size, epochs=config.epochs,
+                  pipeline=config.preprocessing_pipeline, device=str(device))
 
             train_assignments = [
                 dataset
@@ -353,8 +384,12 @@ class ExperimentService:
 
             checkpoint_path = checkpoint_dir / "mejor.pth"
             history_path = artifact_root / "history.json"
+            debug_path = artifact_root / "debug_trace.jsonl"
+            trace("artifact_directories.created", log_path=debug_path, run_id=run_id,
+                  artifact_root=artifact_root, checkpoint_dir=checkpoint_dir)
 
             establecer_semilla(config.seed)
+            trace("seed.set", log_path=debug_path, run_id=run_id, seed=config.seed)
 
             active_assignments = [
                 item for item in spec.datasets if item.role != "unused"
@@ -369,6 +404,12 @@ class ExperimentService:
 
             # Se preparan también las fuentes reservadas para evaluación. Sus
             # particiones train/val nunca se incorporan al entrenamiento.
+            print(
+                f"[Preparación] Construyendo fuentes y particiones: {', '.join(active_source_names)}",
+                flush=True,
+            )
+            trace("prepare_sources.begin", log_path=debug_path, run_id=run_id,
+                  sources=active_source_names, roles={item.source_name: item.role for item in active_assignments})
             prepared = prepare_sources(
                 self.paths,
                 config,
@@ -377,18 +418,27 @@ class ExperimentService:
                 create_missing_splits=True,
                 source_assignments=active_assignments,
             )
-
+            trace("prepare_sources.end", log_path=debug_path, run_id=run_id,
+                  summary={name: {"images": len(item.dataset), "train": len(item.split.train) if item.split else 0,
+                                  "val": len(item.split.val) if item.split else 0,
+                                  "test": len(item.split.test) if item.split else 0}
+                           for name, item in prepared.items()})
+            print("[Preparación] Fuentes y particiones listas.", flush=True)
 
             model_spec = get_model_spec(spec.model_name)
 
+            trace("model_creation.begin", log_path=debug_path, run_id=run_id,
+                  architecture=config.model.architecture, pretrained=config.model.pretrained)
             model = crear_modelo(
                 arquitectura=config.model.architecture,
                 num_classes=config.num_classes,
                 pretrained=config.model.pretrained,
                 dispositivo=device,
             )
+            trace("model_creation.end", log_path=debug_path, run_id=run_id)
 
             config = adaptar_normalizacion_a_modelo(config, model)
+            trace("model_normalization.adapted", log_path=debug_path, run_id=run_id)
 
             preprocessor = ImagePreprocessor(
                 config.preprocessing_pipeline, config.preprocessing_options
@@ -396,12 +446,54 @@ class ExperimentService:
             train_transform = build_train_transform(config=config)
             eval_transform = build_eval_transform(config=config)
 
+            mediapipe_cache = {}
+            mediapipe_summary = None
+            mediapipe_audit_path = None
+            mediapipe_summary_path = None
+
+            if config.preprocessing_pipeline in MEDIAPIPE_PIPELINES:
+                print(
+                    f"[Preparación] Iniciando caché MediaPipe para {sum(len(prepared[name].dataset) for name in source_names)} imágenes.",
+                    flush=True,
+                )
+                trace("mediapipe_cache.begin", log_path=debug_path, run_id=run_id,
+                      cache_root=artifact_root / "cache_mediapipe")
+                (
+                    mediapipe_cache,
+                    mediapipe_summary,
+                    mediapipe_audit_path,
+                    mediapipe_summary_path,
+                ) = prepare_mediapipe_cache(
+                    prepared,
+                    source_names,
+                    preprocessor,
+                    artifact_root / "cache_mediapipe",
+                )
+                trace("mediapipe_cache.end", log_path=debug_path, run_id=run_id,
+                      summary=mediapipe_summary)
+                print("[Preparación] Caché MediaPipe lista. Construyendo DataLoaders.", flush=True)
+
+            trace("dataloaders.begin", log_path=debug_path, run_id=run_id)
             train_parts = [
-                subset_for(prepared[name], "train", train_transform, preprocessor)
+                subset_for(
+                    prepared[name],
+                    "train",
+                    train_transform,
+                    preprocessor,
+                    indices_override=getattr(prepared[name], "_mediapipe_train_indices", None),
+                    roi_boxes=mediapipe_cache.get(name),
+                )
                 for name in source_names
             ]
             val_parts = [
-                subset_for(prepared[name], "val", eval_transform, preprocessor)
+                subset_for(
+                    prepared[name],
+                    "val",
+                    eval_transform,
+                    preprocessor,
+                    indices_override=getattr(prepared[name], "_mediapipe_val_indices", None),
+                    roi_boxes=mediapipe_cache.get(name),
+                )
                 for name in source_names
             ]
 
@@ -425,6 +517,9 @@ class ExperimentService:
                 shuffle=False, seed=config.seed,
             )
 
+            trace("datasets_and_loaders.ready", log_path=debug_path, run_id=run_id,
+                  train_samples=len(train_dataset), val_samples=len(val_dataset),
+                  train_batches=len(train_loader), val_batches=len(val_loader))
             model = (
                 congelar_backbone(model)
                 if config.freeze_backbone
@@ -437,6 +532,10 @@ class ExperimentService:
                 "model_name": spec.model_name,
                 "preprocessing_pipeline": config.preprocessing_pipeline,
                 "preprocessing_options": config.preprocessing_options,
+                "mediapipe_filter_enabled": config.preprocessing_pipeline in MEDIAPIPE_PIPELINES,
+                "mediapipe_filter_summary": mediapipe_summary,
+                "mediapipe_audit_csv": str(mediapipe_audit_path) if mediapipe_audit_path else None,
+                "mediapipe_summary_json": str(mediapipe_summary_path) if mediapipe_summary_path else None,
                 "training_sources": source_names,
                 "dataset_roles": {item.source_name: item.role for item in active_assignments},
                 "source_paths": {
@@ -485,6 +584,12 @@ class ExperimentService:
             })
             save_json(config_payload, artifact_root / "config.json")
 
+            print(
+                f"[Training] Preparación completada. Iniciando entrenamiento "
+                f"con {config.num_classes} clases en dispositivo {device}.",
+                flush=True,
+            )
+            trace("trainer.initialization.begin", log_path=debug_path, run_id=run_id)
             trainer = Trainer(
                 model=model,
                 train_loader=train_loader,
@@ -496,6 +601,10 @@ class ExperimentService:
                 cancel_event=cancel_event,
             )
 
+
+            trace("trainer.initialization.end", log_path=debug_path, run_id=run_id)
+            trace("first_epoch.about_to_start", log_path=debug_path, run_id=run_id,
+                  train_batches=len(train_loader), val_batches=len(val_loader))
 
             # Medición de recursos del entrenamiento.
             if device.type == "cuda":
@@ -640,6 +749,8 @@ class ExperimentService:
             )
 
         except TrainingCancelled as exc:
+            trace_exception("run.cancelled", log_path=locals().get("debug_path"),
+                            run_id=run_id, exc=exc)
             try:
                 current = self.registry.load_run(run_id)
                 if current.status in {"pending", "running"}:
@@ -652,6 +763,8 @@ class ExperimentService:
                 raise
             return self.registry.load_run(run_id)
         except Exception as exc:
+            trace_exception("run.failed", log_path=locals().get("debug_path"),
+                            run_id=run_id, exc=exc)
             try:
                 current = self.registry.load_run(run_id)
                 if (

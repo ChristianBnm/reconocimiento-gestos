@@ -41,6 +41,19 @@ def cargar_clases(path: str | Path | None = None) -> tuple[str, ...]:
     return names
 
 
+
+
+def ordenar_clases(class_names: Sequence[str]) -> tuple[str, ...]:
+    """Orden estable: dígitos, letras A-Z y luego etiquetas adicionales."""
+    def key(name: str):
+        if len(name) == 1 and name.isdigit():
+            return (0, int(name), name)
+        if len(name) == 1 and "A" <= name.upper() <= "Z":
+            return (1, ord(name.upper()) - ord("A"), name)
+        return (2, name.casefold(), name)
+    return tuple(sorted((str(name) for name in class_names), key=key))
+
+
 CLASS_NAMES: tuple[str, ...] = cargar_clases()
 
 
